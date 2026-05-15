@@ -6,6 +6,204 @@ const resultEl = document.getElementById("result");
 
 const charts = { main: null, rsi: null, macd: null, kd: null, adx: null, obv: null };
 
+// ===== 清單（localStorage） =====
+const LS_WATCH = "stocks5.watchlist";
+const LS_HOLD = "stocks5.holdings";
+let currentData = null;  // 目前主畫面顯示的股票（用於加入清單）
+
+function normalizeSymClient(s) {
+  s = s.trim().toUpperCase();
+  if (/^\d+$/.test(s)) return s + ".TW";
+  return s;
+}
+function loadWatchlist() {
+  try { return JSON.parse(localStorage.getItem(LS_WATCH) || "[]"); }
+  catch { return []; }
+}
+function saveWatchlist(list) { localStorage.setItem(LS_WATCH, JSON.stringify(list)); }
+function loadHoldings() {
+  try { return JSON.parse(localStorage.getItem(LS_HOLD) || "[]"); }
+  catch { return []; }
+}
+function saveHoldings(list) { localStorage.setItem(LS_HOLD, JSON.stringify(list)); }
+
+function addWatch(sym) {
+  const s = normalizeSymClient(sym);
+  const list = loadWatchlist();
+  if (!list.includes(s)) { list.push(s); saveWatchlist(list); }
+  refreshLists();
+  updateAddButtons();
+}
+function removeWatch(sym) {
+  saveWatchlist(loadWatchlist().filter(x => x !== sym));
+  refreshLists();
+  updateAddButtons();
+}
+function addHold(sym, cost) {
+  const s = normalizeSymClient(sym);
+  const list = loadHoldings();
+  const ex = list.find(h => h.symbol === s);
+  if (ex) ex.cost = cost; else list.push({ symbol: s, cost });
+  saveHoldings(list);
+  refreshLists();
+  updateAddButtons();
+}
+function removeHold(sym) {
+  saveHoldings(loadHoldings().filter(h => h.symbol !== sym));
+  refreshLists();
+  updateAddButtons();
+}
+
+async function scanSymbols(syms) {
+  if (syms.length === 0) return {};
+  const resp = await fetch(`/api/scan?symbols=${encodeURIComponent(syms.join(","))}`);
+  const data = await resp.json();
+  const lookup = {};
+  for (const r of data.results || []) {
+    if (r.error) {
+      lookup[r.requested] = { error: r.error, requested: r.requested };
+    } else {
+      // 同時用 requested 與 symbol 當 key（用戶可能存了未正規化或 .TWO 重定向後的形態）
+      lookup[r.requested] = r;
+      lookup[r.symbol] = r;
+    }
+  }
+  return lookup;
+}
+
+async function refreshLists() {
+  const watch = loadWatchlist();
+  const hold = loadHoldings();
+  const allSyms = [...new Set([...watch, ...hold.map(h => h.symbol)])];
+  const lookup = await scanSymbols(allSyms);
+  renderWatchlist(watch, lookup);
+  renderHoldings(hold, lookup);
+}
+
+function renderWatchlist(syms, lookup) {
+  const ul = document.getElementById("watchlist");
+  const empty = document.getElementById("watchlist-empty");
+  ul.innerHTML = "";
+  if (syms.length === 0) { empty.classList.remove("hidden"); return; }
+  empty.classList.add("hidden");
+
+  for (const sym of syms) {
+    const info = lookup[sym];
+    const li = makeRow(sym, info, /*isHolding=*/false);
+    ul.appendChild(li);
+  }
+}
+
+function renderHoldings(items, lookup) {
+  const ul = document.getElementById("holdings");
+  const empty = document.getElementById("holdings-empty");
+  const summary = document.getElementById("holdings-summary");
+  ul.innerHTML = "";
+  if (items.length === 0) {
+    empty.classList.remove("hidden");
+    summary.textContent = "";
+    return;
+  }
+  empty.classList.add("hidden");
+
+  let totalCost = 0, totalNow = 0, hasValid = 0;
+  for (const item of items) {
+    const info = lookup[item.symbol];
+    const li = makeRow(item.symbol, info, /*isHolding=*/true, item.cost);
+    ul.appendChild(li);
+    if (info && !info.error && item.cost > 0) {
+      totalCost += item.cost;
+      totalNow += info.price;
+      hasValid++;
+    }
+  }
+  if (hasValid > 0) {
+    const pct = (totalNow - totalCost) / totalCost * 100;
+    summary.textContent = `共 ${items.length} 檔，平均 ${pct >= 0 ? "+" : ""}${pct.toFixed(1)}%`;
+    summary.className = pct >= 0 ? "muted pnl-up" : "muted pnl-dn";
+  } else {
+    summary.textContent = `共 ${items.length} 檔`;
+  }
+}
+
+function makeRow(sym, info, isHolding, cost) {
+  const li = document.createElement("li");
+  li.className = "li-row";
+
+  const nameDiv = document.createElement("div");
+  nameDiv.className = "li-symbol-name";
+  const nameText = info && !info.error ? info.name : "—";
+  const symText = info && !info.error ? info.symbol : sym;
+  nameDiv.innerHTML = `<span class="li-name">${nameText}</span><span class="li-symbol">${symText}</span>`;
+  li.appendChild(nameDiv);
+
+  const price = document.createElement("span");
+  price.className = "li-price";
+  price.textContent = info && !info.error ? fmt(info.price) : "—";
+  li.appendChild(price);
+
+  if (isHolding) {
+    const costEl = document.createElement("span");
+    costEl.className = "li-pnl";
+    if (info && !info.error && cost > 0) {
+      const pnl = (info.price - cost) / cost * 100;
+      costEl.textContent = `${pnl >= 0 ? "+" : ""}${pnl.toFixed(1)}%`;
+      costEl.classList.add(pnl >= 0 ? "up" : "dn");
+      costEl.title = `成本 ${fmt(cost)}`;
+    } else {
+      costEl.textContent = cost > 0 ? `成本 ${fmt(cost)}` : "—";
+    }
+    li.appendChild(costEl);
+  }
+
+  const signal = document.createElement("span");
+  if (info && !info.error && info.signal) {
+    signal.className = "li-signal " + info.signal.class;
+    const score = info.signal.score >= 0 ? `+${info.signal.score}` : `${info.signal.score}`;
+    signal.textContent = `${info.signal.label} ${score}`;
+  } else {
+    signal.className = "li-signal hold";
+    signal.textContent = info && info.error ? "ERR" : "...";
+    if (info && info.error) signal.title = info.error;
+  }
+  li.appendChild(signal);
+
+  const x = document.createElement("button");
+  x.className = "li-x";
+  x.textContent = "×";
+  x.title = "移除";
+  x.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (isHolding) removeHold(sym);
+    else removeWatch(sym);
+  });
+  li.appendChild(x);
+
+  li.addEventListener("click", () => {
+    search(info && !info.error ? info.symbol : sym);
+  });
+  return li;
+}
+
+function updateAddButtons() {
+  const w = document.getElementById("btn-add-watch");
+  const h = document.getElementById("btn-add-hold");
+  if (!currentData) {
+    w.classList.remove("added"); w.textContent = "+ 加入觀察清單";
+    h.classList.remove("added"); h.textContent = "+ 加入持有清單";
+    return;
+  }
+  const sym = currentData.symbol;
+  const inWatch = loadWatchlist().includes(sym);
+  const inHold = loadHoldings().some(x => x.symbol === sym);
+
+  w.classList.toggle("added", inWatch);
+  w.textContent = inWatch ? "✓ 已在觀察清單（再次點擊移除）" : "+ 加入觀察清單";
+
+  h.classList.toggle("added", inHold);
+  h.textContent = inHold ? "✓ 已在持有清單（再次點擊移除）" : "+ 加入持有清單";
+}
+
 function setStatus(msg, isError = false) {
   statusEl.textContent = msg;
   statusEl.classList.toggle("error", isError);
@@ -151,6 +349,8 @@ function render(data) {
   document.getElementById("lvl-d1").textContent = fmt(data.levels["相對低價"]);
   document.getElementById("lvl-d2").textContent = fmt(data.levels["悲觀價"]);
 
+  currentData = data;
+  updateAddButtons();
   renderSignal(data.signal);
   renderTarget(data.target);
   renderNews(data.news);
@@ -419,5 +619,32 @@ yearsSelect.addEventListener("change", () => {
   if (sym) search(sym);
 });
 
-// 預設先查 AAPL
+// ===== 加入清單按鈕 =====
+document.getElementById("btn-add-watch").addEventListener("click", () => {
+  if (!currentData) return;
+  const sym = currentData.symbol;
+  if (loadWatchlist().includes(sym)) removeWatch(sym);
+  else addWatch(sym);
+});
+
+document.getElementById("btn-add-hold").addEventListener("click", () => {
+  if (!currentData) return;
+  const sym = currentData.symbol;
+  const holdings = loadHoldings();
+  const existing = holdings.find(h => h.symbol === sym);
+  if (existing) {
+    if (confirm(`要把 ${sym} 從持有清單移除嗎？`)) removeHold(sym);
+    return;
+  }
+  const defaultCost = currentData.current_price.toFixed(2);
+  const input = prompt(`輸入 ${sym} 的平均成本（每股）：\n（按取消可不填，僅顯示訊號）`, defaultCost);
+  if (input === null) return;
+  const cost = parseFloat(input);
+  addHold(sym, isNaN(cost) || cost <= 0 ? 0 : cost);
+});
+
+document.getElementById("refresh-lists").addEventListener("click", () => refreshLists());
+
+// 預設先查 AAPL；同時載入清單
 search("AAPL");
+refreshLists();

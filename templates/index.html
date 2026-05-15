@@ -15,6 +15,27 @@
   </header>
 
   <main>
+    <!-- 觀察清單 + 持有清單 -->
+    <section class="lists-wrap">
+      <div class="list-card">
+        <div class="list-head">
+          <h3>📋 觀察清單</h3>
+          <button id="refresh-lists" class="mini-btn" title="重新刷新所有清單">⟳ 全部刷新</button>
+        </div>
+        <ul id="watchlist" class="watchlist"></ul>
+        <div id="watchlist-empty" class="empty-msg">尚無項目。查詢股票後，點下方「+ 加入觀察」即可加入。</div>
+      </div>
+
+      <div class="list-card">
+        <div class="list-head">
+          <h3>💼 持有清單</h3>
+          <span class="muted" id="holdings-summary"></span>
+        </div>
+        <ul id="holdings" class="holdings"></ul>
+        <div id="holdings-empty" class="empty-msg">尚無項目。查詢股票後，點下方「+ 加入持有」即可加入。</div>
+      </div>
+    </section>
+
     <section class="controls">
       <form id="search-form">
         <input type="text" id="symbol" placeholder="例：AAPL、2330、0050、TSLA" required autocomplete="off">
@@ -69,6 +90,12 @@
 
       <!-- 訊號明細 -->
       <div class="reason-grid" id="reason-grid"></div>
+
+      <!-- 加入清單按鈕 -->
+      <div class="add-actions">
+        <button id="btn-add-watch" class="action-btn watch">+ 加入觀察清單</button>
+        <button id="btn-add-hold" class="action-btn hold">+ 加入持有清單</button>
+      </div>
 
       <!-- 分析師目標價 -->
       <div id="target-card" class="target-card hidden">

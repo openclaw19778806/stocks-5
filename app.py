@@ -457,20 +457,21 @@ def health():
     return {"status": "ok"}, 200
 
 
-@app.route("/api/stock")
-def get_stock():
-    raw = request.args.get("symbol", "AAPL")
-    years = float(request.args.get("years", 3.5))
+def _get_stock_payload(raw: str, years: float):
+    """共用：抓單檔資料 + 計算指標 + 訊號 → 完整 payload。
+    回傳 (payload, error_msg)；payload 為 None 表示失敗。
+    """
     symbol = normalize_symbol(raw)
-
     cache_key = (symbol, round(years, 2))
     cached = cache_get(cache_key)
     if cached is not None:
-        return jsonify(cached)
+        return cached, None
+    return _fetch_payload(raw, years, symbol, cache_key)
 
+
+def _fetch_payload(raw, years, symbol, cache_key):
     end = datetime.now()
     start = end - timedelta(days=int(years * 365.25))
-
     try:
         ticker, hist = fetch_history(symbol, start, end)
         if hist.empty and symbol.endswith(".TW"):
@@ -481,13 +482,12 @@ def get_stock():
 
         hist = hist.dropna(subset=["Close"])
         if hist.empty or len(hist) < 60:
-            return jsonify({"error": f"找不到 {raw} 的足量資料（需至少 60 個交易日）"}), 404
+            return None, f"找不到 {raw} 的足量資料（需至少 60 個交易日）"
 
         close = hist["Close"]
         dates = hist.index.strftime("%Y-%m-%d").tolist()
         prices = close.to_numpy()
 
-        # 五線譜
         x = np.arange(len(prices))
         slope, intercept = np.polyfit(x, prices, 1)
         trend = slope * x + intercept
@@ -508,7 +508,6 @@ def get_stock():
 
         target = extract_target(info, current)
 
-        # 相對大盤
         bench_sym = benchmark_for(symbol)
         rel_ret = None
         if symbol != bench_sym and len(close) >= 61:
@@ -524,35 +523,28 @@ def get_stock():
         payload = {
             "symbol": symbol, "name": name, "currency": currency,
             "dates": dates, "prices": prices.tolist(),
-
             "trend": trend.tolist(),
             "upper2": (trend + 2 * sigma).tolist(),
             "upper1": (trend + 1 * sigma).tolist(),
             "lower1": (trend - 1 * sigma).tolist(),
             "lower2": (trend - 2 * sigma).tolist(),
-
-            "ma5": to_jsonable(ind["ma5"]),
+            "ma5":  to_jsonable(ind["ma5"]),
             "ma20": to_jsonable(ind["ma20"]),
             "ma60": to_jsonable(ind["ma60"]),
-
-            "rsi": to_jsonable(ind["rsi"]),
+            "rsi":  to_jsonable(ind["rsi"]),
             "macd": to_jsonable(ind["macd"]),
             "macd_signal": to_jsonable(ind["signal"]),
-            "macd_hist": to_jsonable(ind["macd_hist"]),
+            "macd_hist":   to_jsonable(ind["macd_hist"]),
             "k": to_jsonable(ind["k"]),
             "d": to_jsonable(ind["d"]),
-
             "bb_upper": to_jsonable(ind["bb_upper"]),
             "bb_mid":   to_jsonable(ind["bb_mid"]),
             "bb_lower": to_jsonable(ind["bb_lower"]),
-
             "adx":      to_jsonable(ind["adx"]),
             "plus_di":  to_jsonable(ind["plus_di"]),
             "minus_di": to_jsonable(ind["minus_di"]),
-
-            "obv":     to_jsonable(ind["obv"]),
-            "volume":  to_jsonable(ind["volume"]),
-
+            "obv":      to_jsonable(ind["obv"]),
+            "volume":   to_jsonable(ind["volume"]),
             "current_price": current,
             "trend_now": trend_now,
             "sigma": sigma,
@@ -572,15 +564,55 @@ def get_stock():
             "_stale": False,
         }
         cache_set(cache_key, payload)
-        return jsonify(payload)
-
+        return payload, None
     except Exception as e:
-        # Rate limit 等錯誤：若有 6 小時內的舊快取，回 stale 標記
         stale, age = cache_get_stale(cache_key)
         if stale is not None:
             stale = {**stale, "_stale": True, "_age_sec": int(age), "_error": str(e)}
-            return jsonify(stale)
-        return jsonify({"error": str(e)}), 500
+            return stale, None
+        return None, str(e)
+
+
+@app.route("/api/scan")
+def scan():
+    """批量查詢，供觀察清單/持有清單使用，只回傳輕量摘要。"""
+    raw = request.args.get("symbols", "").strip()
+    if not raw:
+        return jsonify({"results": []})
+    syms = [s.strip() for s in raw.split(",") if s.strip()][:50]
+
+    results = []
+    for s in syms:
+        payload, err = _get_stock_payload(s, 3.5)
+        if payload is None:
+            results.append({"requested": s, "error": err})
+            continue
+        results.append({
+            "requested": s,
+            "symbol": payload["symbol"],
+            "name": payload["name"],
+            "currency": payload["currency"],
+            "price": payload["current_price"],
+            "z_score": payload["z_score"],
+            "signal": {
+                "label": payload["signal"]["label"],
+                "score": payload["signal"]["score"],
+                "class": payload["signal"]["class"],
+            },
+            "_stale": payload.get("_stale", False),
+        })
+    return jsonify({"results": results})
+
+
+@app.route("/api/stock")
+def get_stock():
+    raw = request.args.get("symbol", "AAPL")
+    years = float(request.args.get("years", 3.5))
+    payload, err = _get_stock_payload(raw, years)
+    if payload is None:
+        status = 404 if err and "找不到" in err else 500
+        return jsonify({"error": err}), status
+    return jsonify(payload)
 
 
 if __name__ == "__main__":
