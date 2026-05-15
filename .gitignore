@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Flask
+instance/
+.flaskenv
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Logs
+*.log
+/tmp/
+
+# yfinance cache（部分版本會落地）
+*.cache

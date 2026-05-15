@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>五線譜 + 技術指標 · 美股 / 台股</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>📈 五線譜 + 技術指標</h1>
+    <p class="subtitle">回歸 ±σ · MA · RSI · MACD · KD · 綜合 BUY / SELL 建議</p>
+  </header>
+
+  <main>
+    <section class="controls">
+      <form id="search-form">
+        <input type="text" id="symbol" placeholder="例：AAPL、2330、0050、TSLA" required autocomplete="off">
+        <select id="years">
+          <option value="1">1 年</option>
+          <option value="3.5" selected>3.5 年</option>
+          <option value="5">5 年</option>
+          <option value="10">10 年</option>
+        </select>
+        <button type="submit">查詢</button>
+      </form>
+
+      <div class="quick-picks">
+        <span class="label">美股：</span>
+        <button class="chip" data-symbol="AAPL">AAPL</button>
+        <button class="chip" data-symbol="MSFT">MSFT</button>
+        <button class="chip" data-symbol="GOOGL">GOOGL</button>
+        <button class="chip" data-symbol="NVDA">NVDA</button>
+        <button class="chip" data-symbol="TSLA">TSLA</button>
+        <button class="chip" data-symbol="AMZN">AMZN</button>
+        <span class="label tw">台股：</span>
+        <button class="chip" data-symbol="2330.TW">2330 台積電</button>
+        <button class="chip" data-symbol="0050.TW">0050 元大50</button>
+        <button class="chip" data-symbol="0056.TW">0056 高股息</button>
+        <button class="chip" data-symbol="2317.TW">2317 鴻海</button>
+        <button class="chip" data-symbol="2454.TW">2454 聯發科</button>
+        <button class="chip" data-symbol="^TWII">^TWII 加權</button>
+      </div>
+    </section>
+
+    <section id="status"></section>
+
+    <section id="result" class="hidden">
+      <!-- 建議橫幅 -->
+      <div id="signal-banner" class="signal-banner">
+        <div class="signal-left">
+          <div class="signal-label" id="signal-label">—</div>
+          <div class="signal-score">綜合分數 <span id="signal-score">0</span> / 範圍 −9 ~ +9</div>
+        </div>
+        <div class="signal-right">
+          <h2 id="stock-name">—</h2>
+          <div class="row-info">
+            <span id="stock-symbol" class="symbol">—</span>
+            <span class="sep">·</span>
+            <span class="lbl">現價</span>
+            <span id="current-price" class="price-now">—</span>
+            <span id="currency" class="muted"></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 訊號明細 -->
+      <div class="reason-grid" id="reason-grid"></div>
+
+      <!-- 分析師目標價 -->
+      <div id="target-card" class="target-card hidden">
+        <div class="target-head">
+          <div class="t-title">分析師目標價</div>
+          <div class="t-rec-row">
+            <span id="target-rec" class="rec-pill">—</span>
+            <span id="target-count" class="muted">—</span>
+          </div>
+        </div>
+        <div class="target-grid">
+          <div class="t-cell">
+            <span class="lbl">最低 (Low)</span>
+            <b id="t-low">—</b>
+            <span id="t-low-up" class="upside">—</span>
+          </div>
+          <div class="t-cell highlight">
+            <span class="lbl">平均 (Mean)</span>
+            <b id="t-mean">—</b>
+            <span id="t-mean-up" class="upside">—</span>
+          </div>
+          <div class="t-cell">
+            <span class="lbl">中位 (Median)</span>
+            <b id="t-median">—</b>
+            <span id="t-median-up" class="upside">—</span>
+          </div>
+          <div class="t-cell">
+            <span class="lbl">最高 (High)</span>
+            <b id="t-high">—</b>
+            <span id="t-high-up" class="upside">—</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 五線譜價位 -->
+      <div class="levels">
+        <div class="lvl up2"><span>樂觀價 (+2σ)</span><b id="lvl-u2">—</b></div>
+        <div class="lvl up1"><span>相對高價 (+1σ)</span><b id="lvl-u1">—</b></div>
+        <div class="lvl mid"><span>趨勢價</span><b id="lvl-mid">—</b></div>
+        <div class="lvl dn1"><span>相對低價 (−1σ)</span><b id="lvl-d1">—</b></div>
+        <div class="lvl dn2"><span>悲觀價 (−2σ)</span><b id="lvl-d2">—</b></div>
+      </div>
+
+      <!-- 主圖：價格 + 五線譜 + MA -->
+      <div class="chart-wrap main-chart">
+        <canvas id="chart"></canvas>
+      </div>
+
+      <!-- RSI -->
+      <div class="chart-wrap sub-chart">
+        <div class="sub-title">RSI(14) <span class="muted">— 超賣 &lt; 30，超買 &gt; 70</span></div>
+        <canvas id="chart-rsi"></canvas>
+      </div>
+
+      <!-- MACD -->
+      <div class="chart-wrap sub-chart">
+        <div class="sub-title">MACD(12, 26, 9) <span class="muted">— 柱狀體上穿零軸偏多頭</span></div>
+        <canvas id="chart-macd"></canvas>
+      </div>
+
+      <!-- KD -->
+      <div class="chart-wrap sub-chart">
+        <div class="sub-title">KD(9, 3, 3) <span class="muted">— K&lt;20 超賣，K&gt;80 超買；K 上穿 D = 黃金交叉</span></div>
+        <canvas id="chart-kd"></canvas>
+      </div>
+
+      <!-- 相關新聞 -->
+      <div id="news-section" class="news-section">
+        <div class="news-head">📰 相關新聞</div>
+        <ul id="news-list" class="news-list"></ul>
+        <div id="news-empty" class="news-empty hidden">目前沒有相關新聞</div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <small>資料：Yahoo Finance（yfinance）。本工具僅供研究參考，不構成投資建議。</small>
+  </footer>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
