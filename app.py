@@ -1,8 +1,9 @@
 """
-樂活五線譜 + 技術指標 風格的股票走勢查詢網站
+樂活五線譜 + 多指標 風格的股票走勢查詢網站
 支援美股 (AAPL, TSLA...) 與台股 (2330.TW, 0050.TW...)
-回傳：五線譜 / MA5/20/60 / RSI(14) / MACD(12,26,9) / KD(9,3,3)
-並依各指標分數綜合出 BUY / HOLD / SELL 建議
+
+指標：五線譜 / MA / RSI / MACD / KD / 布林帶 / ADX / OBV / 相對大盤強度 / 分析師共識
+依各指標加權分數 → BUY / HOLD / SELL 建議
 """
 from flask import Flask, render_template, request, jsonify
 import yfinance as yf
@@ -15,10 +16,12 @@ from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
-# ===== 簡易 TTL 快取 =====
-# 雲端部署時 yfinance 容易被 Yahoo 限流，做個 5 分鐘快取
+
+# ===== TTL 快取（含 stale-on-error 退避） =====
+# yfinance 新版自帶 curl_cffi 偽裝瀏覽器，session 由它處理。
 _CACHE: dict = {}
-_CACHE_TTL = 300  # 秒
+_CACHE_TTL = 900          # 15 分鐘內視為「新鮮」
+_STALE_MAX = 6 * 3600     # 6 小時內的舊資料可作為失敗時 fallback
 _CACHE_LOCK = threading.Lock()
 
 
@@ -30,28 +33,60 @@ def cache_get(key):
         return None
 
 
+def cache_get_stale(key):
+    with _CACHE_LOCK:
+        item = _CACHE.get(key)
+        if item:
+            age = time.time() - item[0]
+            if age < _STALE_MAX:
+                return item[1], age
+        return None, None
+
+
 def cache_set(key, value):
     with _CACHE_LOCK:
         _CACHE[key] = (time.time(), value)
-        # 簡單上限：超過 200 筆就清掉最舊的
         if len(_CACHE) > 200:
             oldest = min(_CACHE, key=lambda k: _CACHE[k][0])
             _CACHE.pop(oldest, None)
 
 
+# ===== 工具 =====
 REC_LABEL = {
-    "strong_buy": ("強力買進", "strong-buy"),
-    "buy":        ("買進",     "buy"),
-    "hold":       ("持有",     "hold"),
+    "strong_buy":   ("強力買進", "strong-buy"),
+    "buy":          ("買進",     "buy"),
+    "hold":         ("持有",     "hold"),
     "underperform": ("劣於大盤", "sell"),
-    "sell":       ("賣出",     "sell"),
-    "strong_sell": ("強力賣出", "strong-sell"),
-    "none":       ("—",       "hold"),
+    "sell":         ("賣出",     "sell"),
+    "strong_sell":  ("強力賣出", "strong-sell"),
+    "none":         ("—",       "hold"),
 }
 
 
+def normalize_symbol(raw: str) -> str:
+    s = raw.strip().upper()
+    if s.isdigit():
+        return f"{s}.TW"
+    return s
+
+
+def is_tw(symbol: str) -> bool:
+    return symbol.endswith(".TW") or symbol.endswith(".TWO") or symbol == "^TWII"
+
+
+def benchmark_for(symbol: str) -> str:
+    return "0050.TW" if is_tw(symbol) else "SPY"
+
+
+def benchmark_label(sym: str) -> str:
+    return {"SPY": "S&P 500 (SPY)", "0050.TW": "台灣 50 (0050.TW)"}.get(sym, sym)
+
+
+def to_jsonable(series: pd.Series) -> list:
+    return [None if pd.isna(v) else float(v) for v in series]
+
+
 def extract_target(info: dict, current: float) -> dict:
-    """從 yfinance .info 抓分析師目標價；缺值回傳 None 欄位以方便前端判斷。"""
     def num(k):
         v = info.get(k)
         try:
@@ -73,10 +108,7 @@ def extract_target(info: dict, current: float) -> dict:
         return (v - current) / current * 100
 
     return {
-        "mean": mean,
-        "median": median,
-        "high": high,
-        "low": low,
+        "mean": mean, "median": median, "high": high, "low": low,
         "count": count,
         "recommendation": rec,
         "recommendation_label": label,
@@ -90,7 +122,6 @@ def extract_target(info: dict, current: float) -> dict:
 
 
 def extract_news(ticker, limit: int = 10) -> list:
-    """整理 ticker.news 為前端使用的精簡格式；支援新舊兩種 schema。"""
     try:
         raw = ticker.news or []
     except Exception:
@@ -99,18 +130,17 @@ def extract_news(ticker, limit: int = 10) -> list:
     out = []
     for item in raw[:limit]:
         title = url = publisher = pub = thumb = None
-
-        if "content" in item:  # 新版 schema
+        if "content" in item:
             c = item.get("content") or {}
             title = c.get("title")
             publisher = (c.get("provider") or {}).get("displayName")
-            pub = c.get("pubDate")  # ISO 字串
+            pub = c.get("pubDate")
             url = ((c.get("canonicalUrl") or {}).get("url")
                    or (c.get("clickThroughUrl") or {}).get("url"))
-            thumb_list = ((c.get("thumbnail") or {}).get("resolutions") or [])
-            if thumb_list:
-                thumb = thumb_list[-1].get("url")
-        else:  # 舊版
+            res = ((c.get("thumbnail") or {}).get("resolutions") or [])
+            if res:
+                thumb = res[-1].get("url")
+        else:
             title = item.get("title")
             publisher = item.get("publisher")
             url = item.get("link")
@@ -129,30 +159,46 @@ def extract_news(ticker, limit: int = 10) -> list:
     return out
 
 
-def normalize_symbol(raw: str) -> str:
-    """純數字 → 視為台股，自動加上 .TW；其餘保留原樣（大寫）。"""
-    s = raw.strip().upper()
-    if s.isdigit():
-        return f"{s}.TW"
-    return s
+# ===== 抓資料（含 session、benchmark cache） =====
+def fetch_history(symbol, start, end):
+    ticker = yf.Ticker(symbol)
+    hist = ticker.history(start=start, end=end, auto_adjust=True)
+    return ticker, hist
 
 
-def to_jsonable(series: pd.Series) -> list:
-    """pandas Series → list；NaN 轉為 None。"""
-    return [None if pd.isna(v) else float(v) for v in series]
+def fetch_benchmark_return(bench_sym: str, days: int = 60):
+    """近 days 日 benchmark 報酬率（%）。獨立快取 30 分鐘。"""
+    key = ("bench", bench_sym, days)
+    cached = cache_get(key)
+    if cached is not None:
+        return cached
+    end = datetime.now()
+    start = end - timedelta(days=int(days * 2))
+    try:
+        _, h = fetch_history(bench_sym, start, end)
+        h = h.dropna(subset=["Close"])
+        if len(h) < days + 1:
+            return None
+        ret = float(h["Close"].iloc[-1] / h["Close"].iloc[-days] - 1) * 100
+        cache_set(key, ret)
+        return ret
+    except Exception:
+        return None
 
 
+# ===== 指標計算 =====
 def compute_indicators(hist: pd.DataFrame) -> dict:
     close = hist["Close"]
     high = hist["High"]
     low = hist["Low"]
+    volume = hist["Volume"]
 
     # 均線
     ma5 = close.rolling(5).mean()
     ma20 = close.rolling(20).mean()
     ma60 = close.rolling(60).mean()
 
-    # RSI(14) - Wilder smoothing
+    # RSI(14) Wilder
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -161,34 +207,81 @@ def compute_indicators(hist: pd.DataFrame) -> dict:
     rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - 100 / (1 + rs)
 
-    # MACD(12, 26, 9)
+    # MACD(12,26,9)
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     macd_line = ema12 - ema26
     signal_line = macd_line.ewm(span=9, adjust=False).mean()
     macd_hist = macd_line - signal_line
 
-    # KD (9-day Stochastic, 台股慣用 1/3 平滑)
+    # KD(9,3,3)
     low9 = low.rolling(9).min()
     high9 = high.rolling(9).max()
     rsv = (close - low9) / (high9 - low9).replace(0, np.nan) * 100
     k = rsv.ewm(alpha=1 / 3, adjust=False).mean()
     d = k.ewm(alpha=1 / 3, adjust=False).mean()
 
+    # 布林帶(20, 2σ)
+    bb_mid = close.rolling(20).mean()
+    bb_std = close.rolling(20).std(ddof=0)
+    bb_upper = bb_mid + 2 * bb_std
+    bb_lower = bb_mid - 2 * bb_std
+    pct_b = (close - bb_lower) / (bb_upper - bb_lower).replace(0, np.nan)
+
+    # ADX(14)
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / 14, adjust=False).mean()
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = pd.Series(
+        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
+        index=high.index,
+    )
+    minus_dm = pd.Series(
+        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
+        index=high.index,
+    )
+    atr_safe = atr.replace(0, np.nan)
+    plus_di = 100 * plus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr_safe
+    minus_di = 100 * minus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr_safe
+    di_sum = (plus_di + minus_di).replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / di_sum
+    adx = dx.ewm(alpha=1 / 14, adjust=False).mean()
+
+    # OBV + Volume MA20
+    direction = np.sign(close.diff().fillna(0))
+    obv = (direction * volume).cumsum()
+    vol_ma20 = volume.rolling(20).mean()
+
     return {
         "ma5": ma5, "ma20": ma20, "ma60": ma60,
         "rsi": rsi,
         "macd": macd_line, "signal": signal_line, "macd_hist": macd_hist,
         "k": k, "d": d,
+        "bb_upper": bb_upper, "bb_mid": bb_mid, "bb_lower": bb_lower, "pct_b": pct_b,
+        "adx": adx, "plus_di": plus_di, "minus_di": minus_di,
+        "obv": obv, "volume": volume, "vol_ma20": vol_ma20,
     }
 
 
-def build_signal(close: pd.Series, ind: dict, z: float, target: dict | None = None) -> dict:
-    """彙整各指標 → 分數 + 建議。"""
+# ===== 訊號彙整 =====
+def _safe(s, idx=-1, default=0.0):
+    try:
+        v = s.iloc[idx]
+        return float(v) if not pd.isna(v) else default
+    except Exception:
+        return default
+
+
+def build_signal(close, ind, z, target=None,
+                 relative_return=None, benchmark_name=None) -> dict:
     reasons = []
     score = 0
 
-    # 1. 五線譜 z-score
+    # 1. 五線譜 (±2)
     if z <= -1.5:
         score += 2; reasons.append({"score": +2, "name": "五線譜", "detail": f"極度低估 (z={z:+.2f}σ)"})
     elif z <= -0.5:
@@ -200,59 +293,122 @@ def build_signal(close: pd.Series, ind: dict, z: float, target: dict | None = No
     else:
         reasons.append({"score": 0, "name": "五線譜", "detail": f"合理區間 (z={z:+.2f}σ)"})
 
-    # 2. RSI
-    rsi_now = float(ind["rsi"].iloc[-1])
-    if rsi_now < 30:
-        score += 1; reasons.append({"score": +1, "name": "RSI(14)", "detail": f"超賣 ({rsi_now:.1f})"})
-    elif rsi_now > 70:
-        score -= 1; reasons.append({"score": -1, "name": "RSI(14)", "detail": f"超買 ({rsi_now:.1f})"})
-    else:
-        reasons.append({"score": 0, "name": "RSI(14)", "detail": f"中性 ({rsi_now:.1f})"})
+    # 2. 震盪指標 = RSI + KD 合併 (±2)
+    rsi_now = _safe(ind["rsi"])
+    k_now = _safe(ind["k"]); k_prev = _safe(ind["k"], -2)
+    d_now = _safe(ind["d"]); d_prev = _safe(ind["d"], -2)
+    golden = k_prev <= d_prev and k_now > d_now
+    death = k_prev >= d_prev and k_now < d_now
 
-    # 3. MACD（柱狀體方向）
-    h_now = float(ind["macd_hist"].iloc[-1])
-    h_prev = float(ind["macd_hist"].iloc[-2])
-    if h_now > 0 and h_now > h_prev:
+    osc = 0
+    parts = []
+    if rsi_now < 30:
+        osc += 1; parts.append(f"RSI {rsi_now:.0f} 超賣")
+    elif rsi_now > 70:
+        osc -= 1; parts.append(f"RSI {rsi_now:.0f} 超買")
+    else:
+        parts.append(f"RSI {rsi_now:.0f}")
+    if k_now < 20:
+        osc += 1; parts.append(f"K {k_now:.0f} 超賣")
+    elif k_now > 80:
+        osc -= 1; parts.append(f"K {k_now:.0f} 超買")
+    else:
+        parts.append(f"K {k_now:.0f}")
+    if golden and k_now < 30:
+        osc = min(2, osc + 1); parts.append("KD 低檔黃金交叉")
+    elif death and k_now > 70:
+        osc = max(-2, osc - 1); parts.append("KD 高檔死亡交叉")
+    elif golden:
+        parts.append("KD 黃金交叉")
+    elif death:
+        parts.append("KD 死亡交叉")
+    osc = max(-2, min(2, osc))
+    score += osc
+    reasons.append({"score": osc, "name": "震盪指標", "detail": "；".join(parts)})
+
+    # ADX 趨勢強度（用於門檻）
+    adx_now = _safe(ind["adx"])
+    plus_di_now = _safe(ind["plus_di"])
+    minus_di_now = _safe(ind["minus_di"])
+    in_trend = adx_now >= 20
+
+    # 3. MACD (±1)，ADX < 20 視為盤整，不加減分
+    h_now = _safe(ind["macd_hist"])
+    h_prev = _safe(ind["macd_hist"], -2)
+    if not in_trend:
+        reasons.append({"score": 0, "name": "MACD", "detail": f"盤整中 (ADX={adx_now:.0f}<20)，動能訊號低權重"})
+    elif h_now > 0 and h_now > h_prev:
         score += 1; reasons.append({"score": +1, "name": "MACD", "detail": f"柱狀體擴張向上 ({h_now:+.2f})"})
     elif h_now < 0 and h_now < h_prev:
         score -= 1; reasons.append({"score": -1, "name": "MACD", "detail": f"柱狀體擴張向下 ({h_now:+.2f})"})
-    elif h_now > 0:
-        reasons.append({"score": 0, "name": "MACD", "detail": f"多頭但動能轉弱 ({h_now:+.2f})"})
     else:
-        reasons.append({"score": 0, "name": "MACD", "detail": f"空頭但動能轉弱 ({h_now:+.2f})"})
+        reasons.append({"score": 0, "name": "MACD", "detail": f"動能轉弱 ({h_now:+.2f})"})
 
-    # 4. 均線排列
-    p = float(close.iloc[-1])
-    m20 = float(ind["ma20"].iloc[-1])
-    m60 = float(ind["ma60"].iloc[-1])
-    if p > m20 > m60:
+    # 4. 均線 (±1)，同樣受 ADX 門檻過濾
+    p = _safe(close); m20 = _safe(ind["ma20"]); m60 = _safe(ind["ma60"])
+    if not in_trend:
+        reasons.append({"score": 0, "name": "均線", "detail": f"盤整中 (ADX={adx_now:.0f}<20)，均線訊號低權重"})
+    elif p > m20 > m60:
         score += 1; reasons.append({"score": +1, "name": "均線", "detail": "多頭排列（價>MA20>MA60）"})
     elif p < m20 < m60:
         score -= 1; reasons.append({"score": -1, "name": "均線", "detail": "空頭排列（價<MA20<MA60）"})
     else:
         reasons.append({"score": 0, "name": "均線", "detail": "盤整（均線糾結）"})
 
-    # 5. KD (含黃金/死亡交叉)
-    k_now = float(ind["k"].iloc[-1]); k_prev = float(ind["k"].iloc[-2])
-    d_now = float(ind["d"].iloc[-1]); d_prev = float(ind["d"].iloc[-2])
-    golden = k_prev <= d_prev and k_now > d_now
-    death = k_prev >= d_prev and k_now < d_now
-    if golden and k_now < 30:
-        score += 2; reasons.append({"score": +2, "name": "KD", "detail": f"低檔黃金交叉 (K={k_now:.1f})"})
-    elif death and k_now > 70:
-        score -= 2; reasons.append({"score": -2, "name": "KD", "detail": f"高檔死亡交叉 (K={k_now:.1f})"})
-    elif golden:
-        score += 1; reasons.append({"score": +1, "name": "KD", "detail": f"黃金交叉 (K={k_now:.1f})"})
-    elif death:
-        score -= 1; reasons.append({"score": -1, "name": "KD", "detail": f"死亡交叉 (K={k_now:.1f})"})
-    elif k_now < 20:
-        score += 1; reasons.append({"score": +1, "name": "KD", "detail": f"超賣 (K={k_now:.1f})"})
-    elif k_now > 80:
-        score -= 1; reasons.append({"score": -1, "name": "KD", "detail": f"超買 (K={k_now:.1f})"})
+    # 5. 布林帶 (±1)
+    pct_b_val = ind["pct_b"].iloc[-1]
+    pct_b = float(pct_b_val) if not pd.isna(pct_b_val) else 0.5
+    if pct_b < 0.05:
+        score += 1; reasons.append({"score": +1, "name": "布林帶", "detail": f"%B={pct_b:.2f}：跌破下軌"})
+    elif pct_b > 0.95:
+        score -= 1; reasons.append({"score": -1, "name": "布林帶", "detail": f"%B={pct_b:.2f}：突破上軌"})
+    elif pct_b < 0.2:
+        reasons.append({"score": 0, "name": "布林帶", "detail": f"%B={pct_b:.2f}：靠近下軌"})
+    elif pct_b > 0.8:
+        reasons.append({"score": 0, "name": "布林帶", "detail": f"%B={pct_b:.2f}：靠近上軌"})
     else:
-        reasons.append({"score": 0, "name": "KD", "detail": f"中性 (K={k_now:.1f}, D={d_now:.1f})"})
+        reasons.append({"score": 0, "name": "布林帶", "detail": f"%B={pct_b:.2f}：中性"})
 
-    # 6. 分析師共識（目標價 + 推薦）
+    # 6. 量能/OBV (±1)
+    obv = ind["obv"]
+    lookback = min(60, len(obv) - 1)
+    obv_now = _safe(obv); obv_then = _safe(obv, -lookback)
+    obv_change = obv_now - obv_then
+    price_change_pct = (p / _safe(close, -lookback) - 1) * 100 if _safe(close, -lookback) > 0 else 0
+    vol_now = _safe(ind["volume"]); vol_ma = _safe(ind["vol_ma20"], default=vol_now)
+    vol_ratio = vol_now / vol_ma if vol_ma > 0 else 1.0
+
+    obv_dir = 1 if obv_change > 0 else -1 if obv_change < 0 else 0
+    price_dir = 1 if price_change_pct > 1 else -1 if price_change_pct < -1 else 0
+
+    if obv_dir == 1 and price_dir == 1:
+        score += 1; reasons.append({"score": +1, "name": "量能/OBV", "detail": f"60 日量價同步向上，今量/均量 ×{vol_ratio:.1f}"})
+    elif obv_dir == -1 and price_dir == -1:
+        score -= 1; reasons.append({"score": -1, "name": "量能/OBV", "detail": f"60 日量價同步向下，今量/均量 ×{vol_ratio:.1f}"})
+    elif obv_dir == 1 and price_dir == -1:
+        score += 1; reasons.append({"score": +1, "name": "量能/OBV", "detail": "底背離：價跌但 OBV 上揚（買盤累積）"})
+    elif obv_dir == -1 and price_dir == 1:
+        score -= 1; reasons.append({"score": -1, "name": "量能/OBV", "detail": "頂背離：價漲但 OBV 下滑（量能不支持）"})
+    else:
+        reasons.append({"score": 0, "name": "量能/OBV", "detail": f"中性，今量/均量 ×{vol_ratio:.1f}"})
+
+    # 7. 相對大盤 (±2)
+    if relative_return is not None:
+        bn = benchmark_name or "大盤"
+        if relative_return >= 15:
+            score += 2; reasons.append({"score": +2, "name": "相對大盤", "detail": f"60 日大幅強於 {bn} ({relative_return:+.1f}%)"})
+        elif relative_return >= 5:
+            score += 1; reasons.append({"score": +1, "name": "相對大盤", "detail": f"60 日強於 {bn} ({relative_return:+.1f}%)"})
+        elif relative_return <= -15:
+            score -= 2; reasons.append({"score": -2, "name": "相對大盤", "detail": f"60 日大幅弱於 {bn} ({relative_return:+.1f}%)"})
+        elif relative_return <= -5:
+            score -= 1; reasons.append({"score": -1, "name": "相對大盤", "detail": f"60 日弱於 {bn} ({relative_return:+.1f}%)"})
+        else:
+            reasons.append({"score": 0, "name": "相對大盤", "detail": f"與 {bn} 同步 ({relative_return:+.1f}%)"})
+    else:
+        reasons.append({"score": 0, "name": "相對大盤", "detail": "無基準資料"})
+
+    # 8. 分析師共識 (±2)
     if target and target.get("mean") is not None:
         rec = target.get("recommendation") or "none"
         up = target.get("upside_mean")
@@ -271,21 +427,26 @@ def build_signal(close: pd.Series, ind: dict, z: float, target: dict | None = No
     else:
         reasons.append({"score": 0, "name": "分析師共識", "detail": "無資料"})
 
-    # 綜合建議（範圍 −9 ~ +9）
-    if score >= 5:
+    # 綜合（範圍 −12 ~ +12，因 ADX 過濾，常見 −10 ~ +10）
+    if score >= 6:
         label, cls = "STRONG BUY", "strong-buy"
-    elif score >= 2:
+    elif score >= 3:
         label, cls = "BUY", "buy"
-    elif score <= -5:
+    elif score <= -6:
         label, cls = "STRONG SELL", "strong-sell"
-    elif score <= -2:
+    elif score <= -3:
         label, cls = "SELL", "sell"
     else:
         label, cls = "HOLD", "hold"
 
-    return {"score": score, "label": label, "class": cls, "reasons": reasons}
+    return {
+        "score": score, "label": label, "class": cls,
+        "reasons": reasons,
+        "adx": adx_now, "plus_di": plus_di_now, "minus_di": minus_di_now,
+    }
 
 
+# ===== Routes =====
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -311,20 +472,14 @@ def get_stock():
     start = end - timedelta(days=int(years * 365.25))
 
     try:
-        ticker = yf.Ticker(symbol)
-        hist = ticker.history(start=start, end=end, auto_adjust=True)
-
-        # 純數字找不到 .TW，再試上櫃 .TWO
+        ticker, hist = fetch_history(symbol, start, end)
         if hist.empty and symbol.endswith(".TW"):
             symbol_two = symbol.replace(".TW", ".TWO")
-            ticker = yf.Ticker(symbol_two)
-            hist = ticker.history(start=start, end=end, auto_adjust=True)
+            ticker, hist = fetch_history(symbol_two, start, end)
             if not hist.empty:
                 symbol = symbol_two
 
-        # 剔除 Close 為 NaN 的列（盤前/未開盤等）
         hist = hist.dropna(subset=["Close"])
-
         if hist.empty or len(hist) < 60:
             return jsonify({"error": f"找不到 {raw} 的足量資料（需至少 60 個交易日）"}), 404
 
@@ -332,13 +487,12 @@ def get_stock():
         dates = hist.index.strftime("%Y-%m-%d").tolist()
         prices = close.to_numpy()
 
-        # 線性回歸（五線譜）
+        # 五線譜
         x = np.arange(len(prices))
         slope, intercept = np.polyfit(x, prices, 1)
         trend = slope * x + intercept
         sigma = float(np.std(prices - trend, ddof=1))
 
-        # 技術指標
         ind = compute_indicators(hist)
 
         try:
@@ -353,29 +507,34 @@ def get_stock():
         z = (current - trend_now) / sigma if sigma > 0 else 0.0
 
         target = extract_target(info, current)
-        signal = build_signal(close, ind, z, target)
+
+        # 相對大盤
+        bench_sym = benchmark_for(symbol)
+        rel_ret = None
+        if symbol != bench_sym and len(close) >= 61:
+            bench_ret = fetch_benchmark_return(bench_sym)
+            if bench_ret is not None:
+                stock_ret = (current / float(close.iloc[-60]) - 1) * 100
+                rel_ret = stock_ret - bench_ret
+
+        signal = build_signal(close, ind, z, target, rel_ret,
+                              benchmark_label(bench_sym) if rel_ret is not None else None)
         news = extract_news(ticker)
 
         payload = {
-            "symbol": symbol,
-            "name": name,
-            "currency": currency,
-            "dates": dates,
-            "prices": prices.tolist(),
+            "symbol": symbol, "name": name, "currency": currency,
+            "dates": dates, "prices": prices.tolist(),
 
-            # 五線譜
             "trend": trend.tolist(),
             "upper2": (trend + 2 * sigma).tolist(),
             "upper1": (trend + 1 * sigma).tolist(),
             "lower1": (trend - 1 * sigma).tolist(),
             "lower2": (trend - 2 * sigma).tolist(),
 
-            # 均線
             "ma5": to_jsonable(ind["ma5"]),
             "ma20": to_jsonable(ind["ma20"]),
             "ma60": to_jsonable(ind["ma60"]),
 
-            # 技術指標
             "rsi": to_jsonable(ind["rsi"]),
             "macd": to_jsonable(ind["macd"]),
             "macd_signal": to_jsonable(ind["signal"]),
@@ -383,24 +542,44 @@ def get_stock():
             "k": to_jsonable(ind["k"]),
             "d": to_jsonable(ind["d"]),
 
+            "bb_upper": to_jsonable(ind["bb_upper"]),
+            "bb_mid":   to_jsonable(ind["bb_mid"]),
+            "bb_lower": to_jsonable(ind["bb_lower"]),
+
+            "adx":      to_jsonable(ind["adx"]),
+            "plus_di":  to_jsonable(ind["plus_di"]),
+            "minus_di": to_jsonable(ind["minus_di"]),
+
+            "obv":     to_jsonable(ind["obv"]),
+            "volume":  to_jsonable(ind["volume"]),
+
             "current_price": current,
             "trend_now": trend_now,
             "sigma": sigma,
             "z_score": z,
             "levels": {
-                "樂觀價": trend_now + 2 * sigma,
+                "樂觀價":   trend_now + 2 * sigma,
                 "相對高價": trend_now + 1 * sigma,
-                "趨勢價": trend_now,
+                "趨勢價":   trend_now,
                 "相對低價": trend_now - 1 * sigma,
-                "悲觀價": trend_now - 2 * sigma,
+                "悲觀價":   trend_now - 2 * sigma,
             },
+            "benchmark": benchmark_label(bench_sym),
+            "relative_return": rel_ret,
             "signal": signal,
             "target": target,
             "news": news,
+            "_stale": False,
         }
         cache_set(cache_key, payload)
         return jsonify(payload)
+
     except Exception as e:
+        # Rate limit 等錯誤：若有 6 小時內的舊快取，回 stale 標記
+        stale, age = cache_get_stale(cache_key)
+        if stale is not None:
+            stale = {**stale, "_stale": True, "_age_sec": int(age), "_error": str(e)}
+            return jsonify(stale)
         return jsonify({"error": str(e)}), 500
 
 

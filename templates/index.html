@@ -46,13 +46,14 @@
     </section>
 
     <section id="status"></section>
+    <section id="stale-banner" class="stale-banner hidden"></section>
 
     <section id="result" class="hidden">
       <!-- 建議橫幅 -->
       <div id="signal-banner" class="signal-banner">
         <div class="signal-left">
           <div class="signal-label" id="signal-label">—</div>
-          <div class="signal-score">綜合分數 <span id="signal-score">0</span> / 範圍 −9 ~ +9</div>
+          <div class="signal-score">綜合分數 <span id="signal-score">0</span> / 範圍 −12 ~ +12</div>
         </div>
         <div class="signal-right">
           <h2 id="stock-name">—</h2>
@@ -132,6 +133,18 @@
       <div class="chart-wrap sub-chart">
         <div class="sub-title">KD(9, 3, 3) <span class="muted">— K&lt;20 超賣，K&gt;80 超買；K 上穿 D = 黃金交叉</span></div>
         <canvas id="chart-kd"></canvas>
+      </div>
+
+      <!-- ADX -->
+      <div class="chart-wrap sub-chart">
+        <div class="sub-title">ADX(14) + DI <span class="muted">— ADX &gt; 25 表示有明確趨勢；+DI 大於 −DI = 多頭趨勢</span></div>
+        <canvas id="chart-adx"></canvas>
+      </div>
+
+      <!-- OBV + 成交量 -->
+      <div class="chart-wrap sub-chart">
+        <div class="sub-title">OBV + 成交量 <span class="muted">— OBV 走向與股價同步 = 量價配合；背離 = 警訊</span></div>
+        <canvas id="chart-obv"></canvas>
       </div>
 
       <!-- 相關新聞 -->

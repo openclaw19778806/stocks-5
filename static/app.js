@@ -4,7 +4,7 @@ const yearsSelect = document.getElementById("years");
 const statusEl = document.getElementById("status");
 const resultEl = document.getElementById("result");
 
-const charts = { main: null, rsi: null, macd: null, kd: null };
+const charts = { main: null, rsi: null, macd: null, kd: null, adx: null, obv: null };
 
 function setStatus(msg, isError = false) {
   statusEl.textContent = msg;
@@ -160,6 +160,21 @@ function render(data) {
   drawRSI(data);
   drawMACD(data);
   drawKD(data);
+  drawADX(data);
+  drawOBV(data);
+  renderStaleBanner(data);
+}
+
+function renderStaleBanner(data) {
+  const el = document.getElementById("stale-banner");
+  if (!el) return;
+  if (data._stale) {
+    const mins = Math.round((data._age_sec || 0) / 60);
+    el.textContent = `⚠️ Yahoo Finance 暫時限流，顯示 ${mins} 分鐘前的快取資料`;
+    el.classList.remove("hidden");
+  } else {
+    el.classList.add("hidden");
+  }
 }
 
 function ds(label, dates, values, color, opts = {}) {
@@ -221,6 +236,8 @@ function drawMain(data) {
         ds("MA5",  data.dates, data.ma5,  "#fbbf24", { bw: 1, hidden: true }),
         ds("MA20", data.dates, data.ma20, "#a78bfa", { bw: 1.1 }),
         ds("MA60", data.dates, data.ma60, "#06b6d4", { bw: 1.1 }),
+        ds("BB 上軌", data.dates, data.bb_upper, "#94a3b8", { bw: 0.9, dash: [2, 3], hidden: true }),
+        ds("BB 下軌", data.dates, data.bb_lower, "#94a3b8", { bw: 0.9, dash: [2, 3], hidden: true }),
         ds("收盤價", data.dates, data.prices, "#e6e9ef", { bw: 1.8 }),
       ],
     },
@@ -292,6 +309,86 @@ function drawKD(data) {
     },
     options: Object.assign({}, baseOpts, {
       scales: baseScales({ min: 0, max: 100 }),
+    }),
+  });
+}
+
+function drawADX(data) {
+  const ctx = document.getElementById("chart-adx").getContext("2d");
+  if (charts.adx) charts.adx.destroy();
+  const n = data.dates.length;
+  const line25 = Array(n).fill(25);
+  charts.adx = new Chart(ctx, {
+    type: "line",
+    data: {
+      datasets: [
+        ds("有趨勢 25", data.dates, line25, "#94a3b8", { dash: [3, 3], bw: 1 }),
+        ds("ADX",   data.dates, data.adx,      "#fbbf24", { bw: 1.8 }),
+        ds("+DI",   data.dates, data.plus_di,  "#22c55e", { bw: 1.2 }),
+        ds("−DI",   data.dates, data.minus_di, "#ef4444", { bw: 1.2 }),
+      ],
+    },
+    options: Object.assign({}, baseOpts, {
+      scales: baseScales({ min: 0, max: 100 }),
+    }),
+  });
+}
+
+function drawOBV(data) {
+  const ctx = document.getElementById("chart-obv").getContext("2d");
+  if (charts.obv) charts.obv.destroy();
+  // 量能用柱、OBV 用線（雙 y 軸）
+  const volColors = data.prices.map((p, i) => {
+    const prev = data.prices[i - 1];
+    if (prev == null || p == null) return "rgba(148,163,184,0.5)";
+    return p >= prev ? "rgba(34,197,94,0.5)" : "rgba(239,68,68,0.5)";
+  });
+  charts.obv = new Chart(ctx, {
+    data: {
+      datasets: [
+        {
+          type: "bar",
+          label: "成交量",
+          data: data.volume.map((y, i) => ({ x: data.dates[i], y })),
+          backgroundColor: volColors,
+          yAxisID: "yVol",
+          borderWidth: 0,
+        },
+        Object.assign(
+          ds("OBV", data.dates, data.obv, "#4f9cf9", { bw: 1.6 }),
+          { type: "line", yAxisID: "yObv" }
+        ),
+      ],
+    },
+    options: Object.assign({}, baseOpts, {
+      scales: {
+        x: {
+          type: "time",
+          time: { unit: "month", tooltipFormat: "yyyy-MM-dd" },
+          ticks: { color: "#8a93a6", maxTicksLimit: 10 },
+          grid: { color: "rgba(255,255,255,0.05)" },
+        },
+        yVol: {
+          position: "right",
+          ticks: { color: "#8a93a6", callback: (v) => {
+            if (Math.abs(v) >= 1e9) return (v/1e9).toFixed(1)+"B";
+            if (Math.abs(v) >= 1e6) return (v/1e6).toFixed(1)+"M";
+            if (Math.abs(v) >= 1e3) return (v/1e3).toFixed(1)+"K";
+            return v;
+          }},
+          grid: { drawOnChartArea: false },
+        },
+        yObv: {
+          position: "left",
+          ticks: { color: "#8a93a6", callback: (v) => {
+            if (Math.abs(v) >= 1e9) return (v/1e9).toFixed(1)+"B";
+            if (Math.abs(v) >= 1e6) return (v/1e6).toFixed(1)+"M";
+            if (Math.abs(v) >= 1e3) return (v/1e3).toFixed(1)+"K";
+            return v;
+          }},
+          grid: { color: "rgba(255,255,255,0.05)" },
+        },
+      },
     }),
   });
 }

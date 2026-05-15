@@ -118,6 +118,18 @@ button {
 
 .hidden { display: none; }
 
+.stale-banner {
+  max-width: 900px;
+  margin: 0.5rem auto;
+  padding: 0.6rem 1rem;
+  border-radius: 8px;
+  background: rgba(245, 158, 11, 0.15);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  color: #fbbf24;
+  text-align: center;
+  font-size: 0.9rem;
+}
+
 /* ===== 訊號橫幅 ===== */
 .signal-banner {
   display: flex;
