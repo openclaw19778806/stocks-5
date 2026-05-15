@@ -9,12 +9,15 @@ from flask import Flask, render_template, request, jsonify
 import yfinance as yf
 import numpy as np
 import pandas as pd
+import requests
 import os
 import time
 import threading
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
+
+FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
 
 
 # ===== TTL 快取（含 stale-on-error 退避） =====
@@ -157,6 +160,87 @@ def extract_news(ticker, limit: int = 10) -> list:
                 "thumbnail": thumb,
             })
     return out
+
+
+# ===== Finnhub 補強（新聞、推薦評等） =====
+def finnhub_get(path, params, timeout=8):
+    if not FINNHUB_KEY:
+        return None
+    try:
+        params = {**params, "token": FINNHUB_KEY}
+        r = requests.get(f"https://finnhub.io/api/v1{path}",
+                         params=params, timeout=timeout)
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except Exception:
+        return None
+
+
+def finnhub_news(symbol):
+    """美股新聞最豐富；台股通常為空，由 yfinance 補。"""
+    end = datetime.now()
+    start = end - timedelta(days=14)
+    data = finnhub_get("/company-news", {
+        "symbol": symbol,
+        "from": start.strftime("%Y-%m-%d"),
+        "to": end.strftime("%Y-%m-%d"),
+    })
+    if not isinstance(data, list) or not data:
+        return None
+    out = []
+    for item in data[:10]:
+        ts = item.get("datetime")
+        try:
+            iso = datetime.utcfromtimestamp(int(ts)).isoformat() + "Z" if ts else ""
+        except Exception:
+            iso = ""
+        title = item.get("headline", "")
+        url = item.get("url", "")
+        if title and url:
+            out.append({
+                "title": title,
+                "publisher": item.get("source", ""),
+                "url": url,
+                "published": iso,
+                "thumbnail": item.get("image") or None,
+            })
+    return out or None
+
+
+def finnhub_recommendation(symbol):
+    """回傳最新月份的分析師人頭分布 + 推導 recommendation_key。"""
+    data = finnhub_get("/stock/recommendation", {"symbol": symbol})
+    if not isinstance(data, list) or not data:
+        return None
+    latest = data[0]
+    sb = int(latest.get("strongBuy", 0) or 0)
+    b  = int(latest.get("buy", 0) or 0)
+    h  = int(latest.get("hold", 0) or 0)
+    s  = int(latest.get("sell", 0) or 0)
+    ss = int(latest.get("strongSell", 0) or 0)
+    total = sb + b + h + s + ss
+    if total == 0:
+        return None
+
+    bull = sb + b
+    bear = s + ss
+    if sb >= total * 0.5 and bull >= total * 0.7:
+        rec = "strong_buy"
+    elif bull >= total * 0.6:
+        rec = "buy"
+    elif ss >= total * 0.5 and bear >= total * 0.7:
+        rec = "strong_sell"
+    elif bear >= total * 0.5:
+        rec = "sell"
+    else:
+        rec = "hold"
+    return {
+        "recommendation": rec,
+        "count": total,
+        "strong_buy": sb, "buy": b, "hold": h, "sell": s, "strong_sell": ss,
+        "period": latest.get("period"),
+    }
 
 
 # ===== 抓資料（含 session、benchmark cache） =====
@@ -495,18 +579,41 @@ def _fetch_payload(raw, years, symbol, cache_key):
 
         ind = compute_indicators(hist)
 
+        # ticker.info 容易被 Yahoo 擋；失敗也不影響主流程
+        info = {}
         try:
             info = ticker.info or {}
         except Exception:
-            info = {}
+            pass
         name = info.get("longName") or info.get("shortName") or symbol
         currency = info.get("currency", "")
+        # 沒拿到 currency 時用啟發式
+        if not currency:
+            currency = "TWD" if is_tw(symbol) else "USD"
 
         current = float(prices[-1])
         trend_now = float(trend[-1])
         z = (current - trend_now) / sigma if sigma > 0 else 0.0
 
         target = extract_target(info, current)
+
+        # Finnhub 補強推薦評等（覆蓋 yfinance 的 recommendation 欄位，目標價維持 yfinance）
+        fh_rec = finnhub_recommendation(symbol) if FINNHUB_KEY else None
+        if fh_rec:
+            rec = fh_rec["recommendation"]
+            label, cls = REC_LABEL.get(rec, REC_LABEL["none"])
+            target["recommendation"] = rec
+            target["recommendation_label"] = label
+            target["recommendation_class"] = cls
+            target["count"] = fh_rec["count"]
+            target["finnhub_counts"] = {
+                "strong_buy": fh_rec["strong_buy"],
+                "buy": fh_rec["buy"],
+                "hold": fh_rec["hold"],
+                "sell": fh_rec["sell"],
+                "strong_sell": fh_rec["strong_sell"],
+                "period": fh_rec.get("period"),
+            }
 
         bench_sym = benchmark_for(symbol)
         rel_ret = None
@@ -518,7 +625,15 @@ def _fetch_payload(raw, years, symbol, cache_key):
 
         signal = build_signal(close, ind, z, target, rel_ret,
                               benchmark_label(bench_sym) if rel_ret is not None else None)
-        news = extract_news(ticker)
+
+        # 新聞：Finnhub 優先（美股豐富），yfinance fallback（台股）
+        news = []
+        if FINNHUB_KEY:
+            fh_news = finnhub_news(symbol)
+            if fh_news:
+                news = fh_news
+        if not news:
+            news = extract_news(ticker)
 
         payload = {
             "symbol": symbol, "name": name, "currency": currency,
