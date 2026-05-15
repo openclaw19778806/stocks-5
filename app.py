@@ -8,9 +8,35 @@ from flask import Flask, render_template, request, jsonify
 import yfinance as yf
 import numpy as np
 import pandas as pd
+import os
+import time
+import threading
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
+
+# ===== 簡易 TTL 快取 =====
+# 雲端部署時 yfinance 容易被 Yahoo 限流，做個 5 分鐘快取
+_CACHE: dict = {}
+_CACHE_TTL = 300  # 秒
+_CACHE_LOCK = threading.Lock()
+
+
+def cache_get(key):
+    with _CACHE_LOCK:
+        item = _CACHE.get(key)
+        if item and time.time() - item[0] < _CACHE_TTL:
+            return item[1]
+        return None
+
+
+def cache_set(key, value):
+    with _CACHE_LOCK:
+        _CACHE[key] = (time.time(), value)
+        # 簡單上限：超過 200 筆就清掉最舊的
+        if len(_CACHE) > 200:
+            oldest = min(_CACHE, key=lambda k: _CACHE[k][0])
+            _CACHE.pop(oldest, None)
 
 
 REC_LABEL = {
@@ -265,11 +291,21 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/health")
+def health():
+    return {"status": "ok"}, 200
+
+
 @app.route("/api/stock")
 def get_stock():
     raw = request.args.get("symbol", "AAPL")
     years = float(request.args.get("years", 3.5))
     symbol = normalize_symbol(raw)
+
+    cache_key = (symbol, round(years, 2))
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return jsonify(cached)
 
     end = datetime.now()
     start = end - timedelta(days=int(years * 365.25))
@@ -320,7 +356,7 @@ def get_stock():
         signal = build_signal(close, ind, z, target)
         news = extract_news(ticker)
 
-        return jsonify({
+        payload = {
             "symbol": symbol,
             "name": name,
             "currency": currency,
@@ -361,10 +397,14 @@ def get_stock():
             "signal": signal,
             "target": target,
             "news": news,
-        })
+        }
+        cache_set(cache_key, payload)
+        return jsonify(payload)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="127.0.0.1", port=5001)
+    port = int(os.environ.get("PORT", 5001))
+    debug = os.environ.get("FLASK_DEBUG", "0") == "1"
+    app.run(debug=debug, host="0.0.0.0", port=port)
