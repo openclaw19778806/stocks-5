@@ -428,13 +428,13 @@ def build_signal(close, ind, z, target=None,
         reasons.append({"score": 0, "name": "分析師共識", "detail": "無資料"})
 
     # 綜合（範圍 −12 ~ +12，因 ADX 過濾，常見 −10 ~ +10）
-    if score >= 6:
+    if score >= 5:
         label, cls = "STRONG BUY", "strong-buy"
-    elif score >= 3:
+    elif score >= 2:
         label, cls = "BUY", "buy"
-    elif score <= -6:
+    elif score <= -5:
         label, cls = "STRONG SELL", "strong-sell"
-    elif score <= -3:
+    elif score <= -2:
         label, cls = "SELL", "sell"
     else:
         label, cls = "HOLD", "hold"
