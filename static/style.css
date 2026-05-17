@@ -442,6 +442,44 @@ button {
 .upside.neg { color: var(--up); }
 .upside.neu { color: var(--muted); }
 
+/* ===== 籌碼分析 ===== */
+.chip-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1rem 1.25rem;
+  margin-bottom: 1rem;
+}
+.chip-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.6rem;
+  flex-wrap: wrap;
+}
+.chip-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0.5rem;
+}
+@media (max-width: 760px) {
+  .chip-grid { grid-template-columns: repeat(2, 1fr); }
+}
+.chip-cell {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+.chip-cell .lbl { color: var(--muted); font-size: 0.8rem; }
+.chip-cell b { font-size: 1.05rem; font-family: "SF Mono", Menlo, monospace; }
+.chip-cell .muted { font-size: 0.8rem; }
+.chip-cell b.pos { color: var(--down); }
+.chip-cell b.neg { color: var(--up); }
+
 /* ===== 新聞 ===== */
 .news-section {
   background: var(--panel);

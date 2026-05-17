@@ -74,7 +74,7 @@
       <div id="signal-banner" class="signal-banner">
         <div class="signal-left">
           <div class="signal-label" id="signal-label">—</div>
-          <div class="signal-score">綜合分數 <span id="signal-score">0</span> / 範圍 −12 ~ +12</div>
+          <div class="signal-score">綜合分數 <span id="signal-score">0</span> / 範圍 −17 ~ +17（台股含籌碼）</div>
         </div>
         <div class="signal-right">
           <h2 id="stock-name">—</h2>
@@ -126,6 +126,51 @@
             <span class="lbl">最高 (High)</span>
             <b id="t-high">—</b>
             <span id="t-high-up" class="upside">—</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 籌碼分析（台股） -->
+      <div id="chip-card" class="chip-card hidden">
+        <div class="chip-head">
+          <div class="t-title">📊 籌碼分析</div>
+          <span id="chip-date" class="muted">—</span>
+        </div>
+        <div class="chip-grid">
+          <div class="chip-cell">
+            <span class="lbl">外資 5 日</span>
+            <b id="chip-foreign-5d">—</b>
+          </div>
+          <div class="chip-cell">
+            <span class="lbl">外資 20 日</span>
+            <b id="chip-foreign-20d">—</b>
+          </div>
+          <div class="chip-cell">
+            <span class="lbl">投信 20 日</span>
+            <b id="chip-trust-20d">—</b>
+          </div>
+          <div class="chip-cell">
+            <span class="lbl">自營商 20 日</span>
+            <b id="chip-dealer-20d">—</b>
+          </div>
+          <div class="chip-cell">
+            <span class="lbl">外資持股比</span>
+            <b id="chip-foreign-ratio">—</b>
+            <span id="chip-foreign-ratio-chg" class="muted">—</span>
+          </div>
+          <div class="chip-cell">
+            <span class="lbl">融資餘額</span>
+            <b id="chip-margin">—</b>
+            <span id="chip-margin-chg" class="muted">—</span>
+          </div>
+          <div class="chip-cell">
+            <span class="lbl">融券餘額</span>
+            <b id="chip-short">—</b>
+            <span id="chip-short-chg" class="muted">—</span>
+          </div>
+          <div class="chip-cell">
+            <span class="lbl">券資比</span>
+            <b id="chip-ratio">—</b>
           </div>
         </div>
       </div>

@@ -162,6 +162,184 @@ def extract_news(ticker, limit: int = 10) -> list:
     return out
 
 
+# ===== FinMind 籌碼分析（台股） =====
+FINMIND_API = "https://api.finmindtrade.com/api/v4/data"
+
+
+def finmind_get(dataset, data_id, days_back=40):
+    """從 FinMind 抓某 dataset 的最近 days_back 天資料。"""
+    end = datetime.now()
+    start = end - timedelta(days=days_back)
+    params = {
+        "dataset": dataset,
+        "data_id": data_id,
+        "start_date": start.strftime("%Y-%m-%d"),
+        "end_date": end.strftime("%Y-%m-%d"),
+    }
+    try:
+        r = requests.get(FINMIND_API, params=params, timeout=10)
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        if j.get("status") != 200:
+            return None
+        return j.get("data") or []
+    except Exception:
+        return None
+
+
+def fetch_chip_data(stock_no: str):
+    """抓單一台股的籌碼資料：法人 + 持股比 + 融資融券。返回整理後的 dict。"""
+    inst = finmind_get("TaiwanStockInstitutionalInvestorsBuySell", stock_no)
+    shr  = finmind_get("TaiwanStockShareholding", stock_no, days_back=60)
+    mgn  = finmind_get("TaiwanStockMarginPurchaseShortSale", stock_no)
+
+    if not inst and not shr and not mgn:
+        return None
+
+    # ----- 法人：依日期累計 -----
+    # FinMind name 欄位有：Foreign_Investor / Investment_Trust / Dealer_self / Dealer_Hedging / Foreign_Dealer_Self
+    from collections import defaultdict
+    daily = defaultdict(lambda: {"foreign": 0, "trust": 0, "dealer": 0, "vol": 0})
+    if inst:
+        for r in inst:
+            name = r.get("name", "")
+            net = (r.get("buy") or 0) - (r.get("sell") or 0)
+            date = r.get("date")
+            if name in ("Foreign_Investor", "Foreign_Dealer_Self"):
+                daily[date]["foreign"] += net
+            elif name == "Investment_Trust":
+                daily[date]["trust"] += net
+            elif name in ("Dealer_self", "Dealer_Hedging"):
+                daily[date]["dealer"] += net
+            daily[date]["vol"] += (r.get("buy") or 0) + (r.get("sell") or 0)
+
+    dates_sorted = sorted(daily.keys())
+    # 取最近 5 / 20 個交易日累計
+    def cumsum(n, key):
+        return sum(daily[d][key] for d in dates_sorted[-n:])
+
+    inst_summary = {
+        "latest_date": dates_sorted[-1] if dates_sorted else None,
+        "foreign_5d":  cumsum(5,  "foreign"),
+        "foreign_20d": cumsum(20, "foreign"),
+        "trust_5d":    cumsum(5,  "trust"),
+        "trust_20d":   cumsum(20, "trust"),
+        "dealer_5d":   cumsum(5,  "dealer"),
+        "dealer_20d":  cumsum(20, "dealer"),
+        "vol_20d":     cumsum(20, "vol"),
+    }
+
+    # ----- 外資持股比率 -----
+    holding = None
+    if shr:
+        shr_sorted = sorted(shr, key=lambda r: r.get("date", ""))
+        latest = shr_sorted[-1]
+        ratio_now = latest.get("ForeignInvestmentSharesRatio")
+        ratio_30d_ago = None
+        if len(shr_sorted) >= 21:
+            ratio_30d_ago = shr_sorted[-21].get("ForeignInvestmentSharesRatio")
+        elif len(shr_sorted) > 1:
+            ratio_30d_ago = shr_sorted[0].get("ForeignInvestmentSharesRatio")
+        holding = {
+            "latest_date": latest.get("date"),
+            "foreign_ratio": ratio_now,
+            "foreign_ratio_change": (ratio_now - ratio_30d_ago) if (ratio_now is not None and ratio_30d_ago is not None) else None,
+        }
+
+    # ----- 融資融券 -----
+    margin = None
+    if mgn:
+        mgn_sorted = sorted(mgn, key=lambda r: r.get("date", ""))
+        latest = mgn_sorted[-1]
+        m_now = latest.get("MarginPurchaseTodayBalance") or 0
+        s_now = latest.get("ShortSaleTodayBalance") or 0
+        m_5d_ago = mgn_sorted[-6].get("MarginPurchaseTodayBalance") if len(mgn_sorted) >= 6 else None
+        s_5d_ago = mgn_sorted[-6].get("ShortSaleTodayBalance") if len(mgn_sorted) >= 6 else None
+        m_20d_ago = mgn_sorted[-21].get("MarginPurchaseTodayBalance") if len(mgn_sorted) >= 21 else None
+        margin = {
+            "latest_date": latest.get("date"),
+            "margin_balance": m_now,
+            "margin_change_5d": (m_now - m_5d_ago) if m_5d_ago is not None else None,
+            "margin_change_20d": (m_now - m_20d_ago) if m_20d_ago is not None else None,
+            "short_balance": s_now,
+            "short_change_5d": (s_now - s_5d_ago) if s_5d_ago is not None else None,
+            "short_resistance_ratio": (s_now / m_now * 100) if m_now > 0 else None,
+        }
+
+    return {"institutional": inst_summary, "holding": holding, "margin": margin}
+
+
+def compute_chip_reasons(chip: dict) -> list:
+    """依籌碼資料產生 ±5 維度的訊號明細。"""
+    reasons = []
+    if not chip:
+        return reasons
+
+    inst = chip.get("institutional") or {}
+    f20 = inst.get("foreign_20d") or 0
+    f5  = inst.get("foreign_5d") or 0
+    t20 = inst.get("trust_20d") or 0
+    vol20 = inst.get("vol_20d") or 0
+
+    # 外資 20 日累計 / 20 日總成交量 → 強度比
+    if vol20 > 0:
+        f_intensity = f20 / vol20 * 100
+        if f_intensity >= 15:
+            sc = 2; det = f"外資 20 日大幅買超（淨買 {f20/1000:+,.0f} 張，占成交 {f_intensity:+.1f}%）"
+        elif f_intensity >= 5:
+            sc = 1; det = f"外資 20 日買超（淨買 {f20/1000:+,.0f} 張）"
+        elif f_intensity <= -15:
+            sc = -2; det = f"外資 20 日大幅賣超（淨賣 {f20/1000:+,.0f} 張）"
+        elif f_intensity <= -5:
+            sc = -1; det = f"外資 20 日賣超（淨賣 {f20/1000:+,.0f} 張）"
+        else:
+            sc = 0; det = f"外資 20 日中性（淨 {f20/1000:+,.0f} 張）"
+    else:
+        sc, det = 0, "外資資料不足"
+    reasons.append({"score": sc, "name": "外資 20d", "detail": det})
+
+    # 投信 20 日（權重較小，±1）
+    if vol20 > 0:
+        t_intensity = t20 / vol20 * 100
+        if t_intensity >= 3:
+            sc = 1; det = f"投信買超（淨買 {t20/1000:+,.0f} 張）"
+        elif t_intensity <= -3:
+            sc = -1; det = f"投信賣超（淨賣 {t20/1000:+,.0f} 張）"
+        else:
+            sc = 0; det = f"投信中性（淨 {t20/1000:+,.0f} 張）"
+    else:
+        sc, det = 0, "投信資料不足"
+    reasons.append({"score": sc, "name": "投信 20d", "detail": det})
+
+    # 外資持股比 30 日變化
+    h = chip.get("holding") or {}
+    chg = h.get("foreign_ratio_change")
+    if chg is not None:
+        if chg >= 0.5:
+            sc = 1; det = f"外資持股比上升 {chg:+.2f}%（買盤累積中）"
+        elif chg <= -0.5:
+            sc = -1; det = f"外資持股比下降 {chg:+.2f}%（外資出場）"
+        else:
+            sc = 0; det = f"外資持股比變動小 ({chg:+.2f}%)"
+        reasons.append({"score": sc, "name": "外資持股比", "detail": det})
+
+    # 融資 20 日變化（散戶情緒：融資大幅減少代表斷頭洗清，反向 +1）
+    m = chip.get("margin") or {}
+    m20 = m.get("margin_change_20d")
+    if m20 is not None and m.get("margin_balance"):
+        pct = m20 / (m.get("margin_balance") - m20) * 100 if (m.get("margin_balance") - m20) > 0 else 0
+        if pct <= -10:
+            sc = 1; det = f"融資 20 日大降 {pct:+.1f}%（散戶斷頭，籌碼洗清）"
+        elif pct >= 15:
+            sc = -1; det = f"融資 20 日大增 {pct:+.1f}%（散戶追高，潛在套牢）"
+        else:
+            sc = 0; det = f"融資變動小（{pct:+.1f}%）"
+        reasons.append({"score": sc, "name": "融資 20d", "detail": det})
+
+    return reasons
+
+
 # ===== Finnhub 補強（新聞、推薦評等） =====
 def finnhub_get(path, params, timeout=8):
     if not FINNHUB_KEY:
@@ -626,6 +804,29 @@ def _fetch_payload(raw, years, symbol, cache_key):
         signal = build_signal(close, ind, z, target, rel_ret,
                               benchmark_label(bench_sym) if rel_ret is not None else None)
 
+        # 籌碼分析（僅台股）
+        chip = None
+        if is_tw(symbol):
+            stock_no = symbol.replace(".TW", "").replace(".TWO", "")
+            chip = fetch_chip_data(stock_no)
+            if chip:
+                chip_reasons = compute_chip_reasons(chip)
+                # 加入訊號維度
+                signal["reasons"].extend(chip_reasons)
+                signal["score"] += sum(r["score"] for r in chip_reasons)
+                # 重新分類 label（加入籌碼後範圍 ±17）
+                sc = signal["score"]
+                if sc >= 7:
+                    signal["label"], signal["class"] = "STRONG BUY", "strong-buy"
+                elif sc >= 3:
+                    signal["label"], signal["class"] = "BUY", "buy"
+                elif sc <= -7:
+                    signal["label"], signal["class"] = "STRONG SELL", "strong-sell"
+                elif sc <= -3:
+                    signal["label"], signal["class"] = "SELL", "sell"
+                else:
+                    signal["label"], signal["class"] = "HOLD", "hold"
+
         # 新聞：Finnhub 優先（美股豐富），yfinance fallback（台股）
         news = []
         if FINNHUB_KEY:
@@ -676,6 +877,7 @@ def _fetch_payload(raw, years, symbol, cache_key):
             "signal": signal,
             "target": target,
             "news": news,
+            "chip": chip,
             "_stale": False,
         }
         cache_set(cache_key, payload)
@@ -688,20 +890,134 @@ def _fetch_payload(raw, years, symbol, cache_key):
         return None, str(e)
 
 
+def _get_multi_payload(raw: str):
+    """抓一次 10 年資料，本地切出 1/3.5/5/10 年回歸 + 訊號。
+    省 4 倍 yfinance 載荷。回傳 (payload, error)。
+    為了快不 fetch ticker.info（target 設 None），不打 Finnhub、不算 relative strength。
+    訊號分數範圍：±8（少了 analyst 與 relative）"""
+    symbol = normalize_symbol(raw)
+    cache_key = ("multi", symbol)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached, None
+
+    end = datetime.now()
+    start = end - timedelta(days=int(10 * 365.25))
+
+    try:
+        ticker, hist = fetch_history(symbol, start, end)
+        if hist.empty and symbol.endswith(".TW"):
+            symbol_two = symbol.replace(".TW", ".TWO")
+            ticker, hist = fetch_history(symbol_two, start, end)
+            if not hist.empty:
+                symbol = symbol_two
+
+        hist = hist.dropna(subset=["Close"])
+        if hist.empty or len(hist) < 60:
+            return None, f"找不到 {raw} 的足量資料"
+
+        current = float(hist["Close"].iloc[-1])
+        windows = {}
+        for years in [1.0, 3.5, 5.0, 10.0]:
+            ndays = int(years * 252)  # 252 個交易日 ≒ 1 年
+            # 容忍稍短：3.5 年至少要有 2 年資料才計算
+            min_needed = max(60, int(ndays * 0.6))
+            if len(hist) < min_needed:
+                windows[str(years)] = {"error": "資料不足"}
+                continue
+            window_hist = hist.tail(min(len(hist), ndays))
+            close = window_hist["Close"]
+            prices = close.to_numpy()
+            x = np.arange(len(prices))
+            slope, intercept = np.polyfit(x, prices, 1)
+            trend = slope * x + intercept
+            sigma = float(np.std(prices - trend, ddof=1))
+            trend_now = float(trend[-1])
+            current_p = float(prices[-1])
+            z = (current_p - trend_now) / sigma if sigma > 0 else 0.0
+
+            ind = compute_indicators(window_hist)
+            signal = build_signal(close, ind, z,
+                                  target=None, relative_return=None, benchmark_name=None)
+            # 年化趨勢漲幅 = 斜率 × 252 (一年交易日) / 平均價，% — 對負區間 robust
+            mean_p = float(prices.mean())
+            slope_pa_pct = (slope * 252) / mean_p * 100 if mean_p > 0 else 0
+            windows[str(years)] = {
+                "z_score": z,
+                "trend_up": bool(slope > 0),
+                "trend_slope_pa_pct": slope_pa_pct,
+                "signal": {
+                    "label": signal["label"],
+                    "score": signal["score"],
+                    "class": signal["class"],
+                },
+                "days": len(prices),
+            }
+
+        payload = {
+            "symbol": symbol,
+            "current_price": current,
+            "data_days": len(hist),
+            "windows": windows,
+        }
+        cache_set(cache_key, payload)
+        return payload, None
+
+    except Exception as e:
+        stale, age = cache_get_stale(cache_key)
+        if stale is not None:
+            return {**stale, "_stale": True, "_age_sec": int(age)}, None
+        return None, str(e)
+
+
+@app.route("/api/multi")
+def multi_window():
+    raw = request.args.get("symbol", "AAPL")
+    payload, err = _get_multi_payload(raw)
+    if payload is None:
+        return jsonify({"error": err}), 500
+    return jsonify(payload)
+
+
+@app.route("/api/multi_scan")
+def multi_scan():
+    """批量 multi 查詢，供整盤掃描使用。"""
+    raw = request.args.get("symbols", "").strip()
+    if not raw:
+        return jsonify({"results": []})
+    syms = [s.strip() for s in raw.split(",") if s.strip()][:50]
+    results = []
+    for s in syms:
+        payload, err = _get_multi_payload(s)
+        if payload is None:
+            results.append({"requested": s, "error": err})
+        else:
+            results.append({"requested": s, **payload})
+    return jsonify({"results": results})
+
+
 @app.route("/api/scan")
 def scan():
     """批量查詢，供觀察清單/持有清單使用，只回傳輕量摘要。"""
     raw = request.args.get("symbols", "").strip()
+    try:
+        years = float(request.args.get("years", 3.5))
+    except ValueError:
+        years = 3.5
     if not raw:
         return jsonify({"results": []})
     syms = [s.strip() for s in raw.split(",") if s.strip()][:50]
 
     results = []
     for s in syms:
-        payload, err = _get_stock_payload(s, 3.5)
+        payload, err = _get_stock_payload(s, years)
         if payload is None:
             results.append({"requested": s, "error": err})
             continue
+        trend = payload.get("trend") or []
+        trend_slope_pct = None
+        if len(trend) > 1 and trend[0]:
+            trend_slope_pct = (trend[-1] / trend[0] - 1) * 100  # 3.5 年趨勢累積漲幅 %
         results.append({
             "requested": s,
             "symbol": payload["symbol"],
@@ -709,6 +1025,7 @@ def scan():
             "currency": payload["currency"],
             "price": payload["current_price"],
             "z_score": payload["z_score"],
+            "trend_slope_pct": trend_slope_pct,
             "signal": {
                 "label": payload["signal"]["label"],
                 "score": payload["signal"]["score"],

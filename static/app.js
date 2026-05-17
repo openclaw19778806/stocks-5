@@ -265,6 +265,84 @@ function upsideClass(v) {
   return "neu";
 }
 
+function fmtLots(shares) {
+  // shares → 張 (1 張 = 1000 股)
+  if (shares === null || shares === undefined) return "—";
+  const lots = shares / 1000;
+  const s = lots >= 0 ? "+" : "";
+  if (Math.abs(lots) >= 10000) return s + (lots/10000).toFixed(1) + "萬張";
+  return s + lots.toLocaleString(undefined, {maximumFractionDigits: 0}) + " 張";
+}
+
+function colorClass(v) {
+  if (v === null || v === undefined || Number.isNaN(v)) return "";
+  if (v > 0) return "pos";
+  if (v < 0) return "neg";
+  return "";
+}
+
+function renderChip(chip) {
+  const card = document.getElementById("chip-card");
+  if (!chip || (!chip.institutional && !chip.holding && !chip.margin)) {
+    card.classList.add("hidden");
+    return;
+  }
+  card.classList.remove("hidden");
+
+  const inst = chip.institutional || {};
+  document.getElementById("chip-date").textContent =
+    inst.latest_date ? `資料日 ${inst.latest_date}` : "";
+
+  const setFlow = (id, v) => {
+    const el = document.getElementById(id);
+    el.textContent = fmtLots(v);
+    el.className = colorClass(v);
+  };
+  setFlow("chip-foreign-5d",  inst.foreign_5d);
+  setFlow("chip-foreign-20d", inst.foreign_20d);
+  setFlow("chip-trust-20d",   inst.trust_20d);
+  setFlow("chip-dealer-20d",  inst.dealer_20d);
+
+  const h = chip.holding || {};
+  if (h.foreign_ratio !== undefined && h.foreign_ratio !== null) {
+    document.getElementById("chip-foreign-ratio").textContent = h.foreign_ratio.toFixed(2) + "%";
+    const chg = h.foreign_ratio_change;
+    const chgEl = document.getElementById("chip-foreign-ratio-chg");
+    if (chg !== null && chg !== undefined) {
+      chgEl.textContent = `30 日 ${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%`;
+      chgEl.className = "muted " + (chg > 0 ? "pos" : chg < 0 ? "neg" : "");
+    } else {
+      chgEl.textContent = "";
+    }
+  } else {
+    document.getElementById("chip-foreign-ratio").textContent = "—";
+    document.getElementById("chip-foreign-ratio-chg").textContent = "";
+  }
+
+  const m = chip.margin || {};
+  if (m.margin_balance !== undefined) {
+    document.getElementById("chip-margin").textContent = m.margin_balance.toLocaleString() + " 張";
+    const c20 = m.margin_change_20d;
+    document.getElementById("chip-margin-chg").textContent =
+      c20 !== null && c20 !== undefined
+        ? `20 日 ${c20 >= 0 ? "+" : ""}${c20.toLocaleString()} 張` : "";
+    document.getElementById("chip-margin-chg").className = "muted " + (c20 < 0 ? "pos" : c20 > 0 ? "neg" : "");
+
+    document.getElementById("chip-short").textContent = (m.short_balance ?? 0).toLocaleString() + " 張";
+    const s5 = m.short_change_5d;
+    document.getElementById("chip-short-chg").textContent =
+      s5 !== null && s5 !== undefined
+        ? `5 日 ${s5 >= 0 ? "+" : ""}${s5.toLocaleString()} 張` : "";
+
+    const ratio = m.short_resistance_ratio;
+    document.getElementById("chip-ratio").textContent =
+      ratio !== null && ratio !== undefined ? ratio.toFixed(2) + "%" : "—";
+  } else {
+    ["chip-margin", "chip-margin-chg", "chip-short", "chip-short-chg", "chip-ratio"]
+      .forEach(id => document.getElementById(id).textContent = "—");
+  }
+}
+
 function renderTarget(t) {
   const card = document.getElementById("target-card");
   if (!t || t.mean === null) {
@@ -353,6 +431,7 @@ function render(data) {
   updateAddButtons();
   renderSignal(data.signal);
   renderTarget(data.target);
+  renderChip(data.chip);
   renderNews(data.news);
   resultEl.classList.remove("hidden");
 
