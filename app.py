@@ -970,6 +970,59 @@ def _get_multi_payload(raw: str):
         return None, str(e)
 
 
+def _get_chip_only(raw):
+    """單獨抓籌碼資料 + 計分（台股專用）。"""
+    symbol = normalize_symbol(raw)
+    if not is_tw(symbol):
+        return None, "not a TW stock"
+    stock_no = symbol.replace(".TW", "").replace(".TWO", "")
+    cache_key = ("chip_only", stock_no)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached, None
+    try:
+        chip = fetch_chip_data(stock_no)
+        if not chip:
+            return None, "no chip data"
+        reasons = compute_chip_reasons(chip)
+        payload = {
+            "symbol": symbol,
+            "chip": chip,
+            "reasons": reasons,
+            "score": sum(r["score"] for r in reasons),
+        }
+        cache_set(cache_key, payload)
+        return payload, None
+    except Exception as e:
+        return None, str(e)
+
+
+@app.route("/api/chip")
+def chip_only():
+    raw = request.args.get("symbol", "")
+    payload, err = _get_chip_only(raw)
+    if payload is None:
+        return jsonify({"error": err}), 404
+    return jsonify(payload)
+
+
+@app.route("/api/chip_scan")
+def chip_scan():
+    """批量抓籌碼，只回計分結果，供掃描使用。"""
+    raw = request.args.get("symbols", "").strip()
+    if not raw:
+        return jsonify({"results": []})
+    syms = [s.strip() for s in raw.split(",") if s.strip()][:50]
+    results = []
+    for s in syms:
+        payload, err = _get_chip_only(s)
+        if payload is None:
+            results.append({"requested": s, "error": err})
+        else:
+            results.append({"requested": s, **payload})
+    return jsonify({"results": results})
+
+
 @app.route("/api/multi")
 def multi_window():
     raw = request.args.get("symbol", "AAPL")
