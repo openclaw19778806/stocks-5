@@ -175,6 +175,36 @@
         </div>
       </div>
 
+      <!-- 樂活通道：EPS 估值 + 歷史百分位 -->
+      <div id="val-card" class="val-card hidden">
+        <div class="val-head">
+          <div class="t-title">🎯 樂活通道</div>
+          <span class="muted">補充五線譜的另兩種估值視角</span>
+        </div>
+        <div class="val-cols">
+          <div id="val-eps" class="val-col hidden">
+            <div class="val-sub">
+              <span class="val-title">📈 EPS × P/E 估值</span>
+              <span id="val-eps-zone" class="zone-pill">—</span>
+            </div>
+            <div class="val-stats">
+              <span id="val-eps-stats" class="muted">—</span>
+            </div>
+            <ul id="val-eps-levels" class="val-levels"></ul>
+          </div>
+          <div id="val-pct" class="val-col hidden">
+            <div class="val-sub">
+              <span class="val-title">📊 歷史價格百分位</span>
+              <span id="val-pct-zone" class="zone-pill">—</span>
+            </div>
+            <div class="val-stats">
+              <span id="val-pct-stats" class="muted">—</span>
+            </div>
+            <ul id="val-pct-levels" class="val-levels"></ul>
+          </div>
+        </div>
+      </div>
+
       <!-- 五線譜價位 -->
       <div class="levels">
         <div class="lvl up2"><span>樂觀價 (+2σ)</span><b id="lvl-u2">—</b></div>

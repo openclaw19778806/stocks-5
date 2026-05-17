@@ -340,6 +340,161 @@ def compute_chip_reasons(chip: dict) -> list:
     return reasons
 
 
+# ===== 樂活通道（EPS × P/E 估值 + 歷史百分位） =====
+def fetch_eps_history_tw(stock_no: str) -> list:
+    """FinMind 抓近 ~10 年季度 EPS，回傳 [(year, ttm_eps)] 列表（年度）"""
+    raw = finmind_get("TaiwanStockFinancialStatements", stock_no, days_back=365 * 10)
+    if not raw:
+        return []
+    eps_rows = [r for r in raw if r.get("type") == "EPS"]
+    # 依年度彙總（每年 4 季加總）
+    from collections import defaultdict
+    yearly = defaultdict(float)
+    qcount = defaultdict(int)
+    for r in eps_rows:
+        date = r.get("date", "")
+        if not date or len(date) < 4: continue
+        yr = date[:4]
+        try:
+            yearly[yr] += float(r.get("value") or 0)
+            qcount[yr] += 1
+        except (TypeError, ValueError):
+            pass
+    # 只保留完整 4 季的年度（避免今年累計不完整影響極值）
+    return [{"year": y, "eps": yearly[y], "quarters": qcount[y]}
+            for y in sorted(yearly.keys()) if qcount[y] >= 4]
+
+
+def fetch_eps_history_us(ticker) -> list:
+    """yfinance income_stmt 取 Basic EPS 年度歷史"""
+    try:
+        is_ = ticker.income_stmt
+        if is_ is None or is_.empty:
+            return []
+        if "Basic EPS" in is_.index:
+            row = is_.loc["Basic EPS"]
+            out = []
+            for date, val in row.items():
+                try:
+                    if val is None or pd.isna(val): continue
+                    out.append({"year": str(date.year), "eps": float(val), "quarters": 4})
+                except Exception:
+                    pass
+            return sorted(out, key=lambda x: x["year"])
+    except Exception:
+        pass
+    return []
+
+
+def compute_eps_valuation(eps_history: list, current_price: float,
+                          price_series=None) -> dict | None:
+    """樂活通道（EPS × P/E）估值。
+    若 price_series 提供，會額外算「個股自身 P/E 歷史百分位」用來校準倍率。
+    """
+    if not eps_history or len(eps_history) < 3:
+        return None
+    eps = [e["eps"] for e in eps_history if e["eps"] is not None]
+    if not eps: return None
+    positive = [v for v in eps if v > 0]
+    if not positive:
+        return None
+    min_eps = min(eps)
+    max_eps = max(eps)
+    avg_pos = sum(positive) / len(positive)
+
+    # ── 方法 1：樂活大叔固定倍率（保守）─────────────
+    levels_std = {
+        "便宜價":   max(0, min_eps * 8) if min_eps > 0 else avg_pos * 8 * 0.7,
+        "相對便宜": max(0, min_eps * 12) if min_eps > 0 else avg_pos * 10,
+        "合理價":   avg_pos * 15,
+        "相對昂貴": max_eps * 18,
+        "昂貴價":   max_eps * 22,
+    }
+
+    # ── 方法 2：個股自身歷史 P/E 百分位校準 ─────────
+    # 用實際歷史 P/E 的 P25 / P50 / P75 當倍率，更貼近市場真實給的倍數
+    levels_hist = None
+    pe_stats = None
+    if price_series is not None and len(price_series) > 252:
+        # 對齊：每個 EPS 年度找一個年中價，算 P/E
+        # 但這需要 price_series 帶日期資訊；簡化為用整段 P/E 平均
+        # 用 TTM EPS（最近 4 季加總）算當前 P/E
+        ttm_eps = sum(positive[-len(positive):]) / len(positive)  # 用 avg 替代
+        # 算近 1 年每日 P/E（用當期 avg EPS）
+        recent_p = np.asarray(price_series[-252:], dtype=float)
+        pe_hist = recent_p / ttm_eps if ttm_eps > 0 else None
+        if pe_hist is not None and len(pe_hist) > 50:
+            p25 = float(np.percentile(pe_hist, 25))
+            p50 = float(np.percentile(pe_hist, 50))
+            p75 = float(np.percentile(pe_hist, 75))
+            pe_stats = {"p25": p25, "p50": p50, "p75": p75,
+                        "current_pe": float(current_price / ttm_eps) if ttm_eps > 0 else None}
+            levels_hist = {
+                "便宜價":   ttm_eps * (p25 * 0.7),
+                "相對便宜": ttm_eps * p25,
+                "合理價":   ttm_eps * p50,
+                "相對昂貴": ttm_eps * p75,
+                "昂貴價":   ttm_eps * (p75 * 1.3),
+            }
+
+    # 用校準後的（如果有）判斷位階；否則用標準倍率
+    judge = levels_hist or levels_std
+    if current_price <= judge["便宜價"]:
+        zone = "低估"
+    elif current_price <= judge["合理價"]:
+        zone = "合理偏低"
+    elif current_price <= judge["相對昂貴"]:
+        zone = "合理偏高"
+    elif current_price <= judge["昂貴價"]:
+        zone = "偏貴"
+    else:
+        zone = "嚴重高估"
+
+    return {
+        "levels_standard": {k: float(v) for k, v in levels_std.items()},
+        "levels_calibrated": {k: float(v) for k, v in levels_hist.items()} if levels_hist else None,
+        "pe_stats": pe_stats,
+        "eps_min": float(min_eps),
+        "eps_avg": float(avg_pos),
+        "eps_max": float(max_eps),
+        "years_used": len(eps),
+        "zone": zone,
+        "history": eps_history,
+    }
+
+
+def compute_percentile_channel(prices, current_price: float) -> dict:
+    """歷史價格百分位通道。傳入完整 price array（多年）。"""
+    arr = np.asarray(prices, dtype=float)
+    arr = arr[~np.isnan(arr)]
+    if len(arr) < 30:
+        return None
+    levels = {
+        "P10 (極低)": float(np.percentile(arr, 10)),
+        "P25 (低)":   float(np.percentile(arr, 25)),
+        "P50 (中)":   float(np.percentile(arr, 50)),
+        "P75 (高)":   float(np.percentile(arr, 75)),
+        "P90 (極高)": float(np.percentile(arr, 90)),
+    }
+    cur_pctile = float((arr <= current_price).sum() / len(arr) * 100)
+    if cur_pctile <= 10:
+        zone = "極低位階"
+    elif cur_pctile <= 25:
+        zone = "低位階"
+    elif cur_pctile <= 75:
+        zone = "中位階"
+    elif cur_pctile <= 90:
+        zone = "高位階"
+    else:
+        zone = "極高位階"
+    return {
+        "levels": levels,
+        "current_percentile": cur_pctile,
+        "zone": zone,
+        "samples": len(arr),
+    }
+
+
 # ===== Finnhub 補強（新聞、推薦評等） =====
 def finnhub_get(path, params, timeout=8):
     if not FINNHUB_KEY:
@@ -804,6 +959,21 @@ def _fetch_payload(raw, years, symbol, cache_key):
         signal = build_signal(close, ind, z, target, rel_ret,
                               benchmark_label(bench_sym) if rel_ret is not None else None)
 
+        # 樂活通道：EPS 估值 + 歷史百分位
+        valuation = {"eps_based": None, "percentile": None}
+        valuation["percentile"] = compute_percentile_channel(prices, current)
+        if is_tw(symbol):
+            stock_no = symbol.replace(".TW", "").replace(".TWO", "")
+            eps_hist = fetch_eps_history_tw(stock_no)
+            if eps_hist:
+                valuation["eps_based"] = compute_eps_valuation(eps_hist, current,
+                                                                price_series=prices)
+        else:
+            eps_hist = fetch_eps_history_us(ticker)
+            if eps_hist:
+                valuation["eps_based"] = compute_eps_valuation(eps_hist, current,
+                                                                price_series=prices)
+
         # 籌碼分析（僅台股）
         chip = None
         if is_tw(symbol):
@@ -878,6 +1048,7 @@ def _fetch_payload(raw, years, symbol, cache_key):
             "target": target,
             "news": news,
             "chip": chip,
+            "valuation": valuation,
             "_stale": False,
         }
         cache_set(cache_key, payload)

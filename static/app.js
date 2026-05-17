@@ -265,6 +265,73 @@ function upsideClass(v) {
   return "neu";
 }
 
+function zoneClass(zone) {
+  if (!zone) return "fair";
+  if (/低估|極低/.test(zone) || /低位/.test(zone)) return "cheap";
+  if (/高估|偏貴|極高|高位/.test(zone)) return "pricey";
+  return "fair";
+}
+
+function buildLevels(levels, currentPrice, orderHigh2Low) {
+  const items = orderHigh2Low.map((key) => ({
+    key, val: levels[key],
+  })).filter(o => typeof o.val === "number");
+  items.sort((a, b) => b.val - a.val);  // 高到低
+  const classes = ["lvl-up2", "lvl-up1", "lvl-mid", "lvl-dn1", "lvl-dn2"];
+  return items.map((o, i) => {
+    const cls = classes[i] || "lvl-mid";
+    // 是否「現價在此區間之內」(此值 ≥ current ≥ next value)
+    const next = items[i + 1];
+    const inThisBand = (o.val >= currentPrice) && (!next || next.val <= currentPrice);
+    const mark = inThisBand ? `<span class="cur-marker">← 現價 ${fmt(currentPrice)}</span>` : "";
+    return `<li class="${cls}"><span>${o.key}</span><b>${fmt(o.val)}${mark}</b></li>`;
+  }).join("");
+}
+
+function renderValuation(val, currentPrice) {
+  const card = document.getElementById("val-card");
+  if (!val || (!val.eps_based && !val.percentile)) {
+    card.classList.add("hidden");
+    return;
+  }
+  card.classList.remove("hidden");
+
+  // EPS 估值
+  const epsEl = document.getElementById("val-eps");
+  if (val.eps_based) {
+    epsEl.classList.remove("hidden");
+    const e = val.eps_based;
+    // 優先用校準後的 levels（基於個股自身 P/E 分布）
+    const lvls = e.levels_calibrated || e.levels_standard;
+    const label = e.levels_calibrated ? "（自身歷史 P/E 校準）" : "（樂活大叔倍率）";
+    document.getElementById("val-eps-zone").textContent = e.zone;
+    document.getElementById("val-eps-zone").className = "zone-pill " + zoneClass(e.zone);
+    const stats = `EPS ${e.eps_min.toFixed(2)} ~ ${e.eps_max.toFixed(2)}（${e.years_used} 年）${label}`
+      + (e.pe_stats ? `．自身 P/E P25/P50/P75 = ${e.pe_stats.p25.toFixed(1)}/${e.pe_stats.p50.toFixed(1)}/${e.pe_stats.p75.toFixed(1)}`
+                    + (e.pe_stats.current_pe ? `，現 P/E ${e.pe_stats.current_pe.toFixed(1)}` : "") : "");
+    document.getElementById("val-eps-stats").textContent = stats;
+    const order = ["昂貴價", "相對昂貴", "合理價", "相對便宜", "便宜價"];
+    document.getElementById("val-eps-levels").innerHTML = buildLevels(lvls, currentPrice, order);
+  } else {
+    epsEl.classList.add("hidden");
+  }
+
+  // 歷史百分位
+  const pctEl = document.getElementById("val-pct");
+  if (val.percentile) {
+    pctEl.classList.remove("hidden");
+    const p = val.percentile;
+    document.getElementById("val-pct-zone").textContent = p.zone;
+    document.getElementById("val-pct-zone").className = "zone-pill " + zoneClass(p.zone);
+    document.getElementById("val-pct-stats").textContent =
+      `現價 ${currentPrice.toFixed(2)} 落在歷史 ${p.current_percentile.toFixed(1)}%  (${p.samples} 個交易日樣本)`;
+    const order = ["P90 (極高)", "P75 (高)", "P50 (中)", "P25 (低)", "P10 (極低)"];
+    document.getElementById("val-pct-levels").innerHTML = buildLevels(p.levels, currentPrice, order);
+  } else {
+    pctEl.classList.add("hidden");
+  }
+}
+
 function fmtLots(shares) {
   // shares → 張 (1 張 = 1000 股)
   if (shares === null || shares === undefined) return "—";
@@ -431,6 +498,7 @@ function render(data) {
   updateAddButtons();
   renderSignal(data.signal);
   renderTarget(data.target);
+  renderValuation(data.valuation, data.current_price);
   renderChip(data.chip);
   renderNews(data.news);
   resultEl.classList.remove("hidden");
